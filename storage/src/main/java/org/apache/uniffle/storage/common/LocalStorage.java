@@ -311,8 +311,8 @@ public class LocalStorage extends AbstractStorage {
     return isCorrupted;
   }
 
-  public void markCorrupted() {
-    isCorrupted = true;
+  public void markCorrupted(boolean isCorrupted) {
+    this.isCorrupted = isCorrupted;
   }
 
   public Set<String> getAppIds() {

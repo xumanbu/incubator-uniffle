@@ -134,7 +134,7 @@ public class LocalStorageManagerTest {
 
     // case2: one storage is corrupted, and it will switch to other storage at the first time of writing
     // event of (appId, shuffleId, startPartition)
-    ((LocalStorage)storage1).markCorrupted();
+    ((LocalStorage)storage1).markCorrupted(true);
     Storage storage4 = localStorageManager.selectStorage(dataFlushEvent1);
     assertNotEquals(storage4.getStoragePath(), storage1.getStoragePath());
     assertEquals(localStorageManager.selectStorage(dataReadEvent), storage4);
@@ -153,7 +153,7 @@ public class LocalStorageManagerTest {
     // but before reading this partition, another storage corrupted, it still could read the original data.
     Storage storage7 = localStorageManager.selectStorage(dataFlushEvent1);
     Storage restStorage = storages.stream().filter(x -> !x.isCorrupted() && x != storage7).findFirst().get();
-    ((LocalStorage)restStorage).markCorrupted();
+    ((LocalStorage)restStorage).markCorrupted(true);
     Storage storage8 = localStorageManager.selectStorage(dataReadEvent);
     assertEquals(storage7, storage8);
   }

@@ -126,7 +126,7 @@ public class MultiStorageManagerTest {
         1, appId, 1, 1, 1, 1000, blocks, null, null);
     Storage storage = manager.selectStorage(event);
     assertTrue((storage instanceof LocalStorage));
-    ((LocalStorage)storage).markCorrupted();
+    ((LocalStorage)storage).markCorrupted(true);
     event = new ShuffleDataFlushEvent(
         1, appId, 1, 1, 1, 1000, blocks, null, null);
     assertTrue((manager.selectStorage(event) instanceof HdfsStorage));

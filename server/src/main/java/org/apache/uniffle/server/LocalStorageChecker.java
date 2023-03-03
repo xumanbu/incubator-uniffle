@@ -74,9 +74,11 @@ public class LocalStorageChecker extends Checker {
 
     for (StorageInfo storageInfo : storageInfos) {
       if (!storageInfo.checkStorageReadAndWrite()) {
-        storageInfo.markCorrupted();
+        storageInfo.markCorrupted(true);
         corruptedDirs++;
         continue;
+      }else{
+        storageInfo.markCorrupted(false);
       }
 
       totalSpace += getTotalSpace(storageInfo.storageDir);
@@ -212,8 +214,8 @@ public class LocalStorageChecker extends Checker {
       return true;
     }
 
-    public void markCorrupted() {
-      storage.markCorrupted();
+    public void markCorrupted(boolean isCorrupted) {
+      storage.markCorrupted(isCorrupted);
     }
   }
 }
