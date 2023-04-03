@@ -15,30 +15,36 @@
  * limitations under the License.
  */
 
-package org.apache.spark.shuffle;
+package org.apache.uniffle.shuffle.manager;
 
-import java.util.Map;
+import java.util.LinkedHashSet;
 import java.util.Set;
 
-import org.apache.commons.lang3.SystemUtils;
-import org.apache.spark.SparkConf;
-import org.apache.spark.shuffle.writer.DataPusher;
+public class DummyRssShuffleManager implements RssShuffleManagerInterface {
+  public Set<Integer> unregisteredShuffleIds = new LinkedHashSet<>();
 
-public class TestUtils {
-
-  private TestUtils() {
+  @Override
+  public String getAppId() {
+    return "testAppId";
   }
 
-  public static RssShuffleManager createShuffleManager(
-      SparkConf conf,
-      Boolean isDriver,
-      DataPusher dataPusher,
-      Map<String, Set<Long>> successBlockIds,
-      Map<String, Set<Long>> failBlockIds) {
-    return new RssShuffleManager(conf, isDriver, dataPusher, successBlockIds, failBlockIds);
+  @Override
+  public int getMaxFetchFailures() {
+    return 2;
   }
 
-  public static boolean isMacOnAppleSilicon() {
-    return SystemUtils.IS_OS_MAC_OSX && SystemUtils.OS_ARCH.equals("aarch64");
+  @Override
+  public int getPartitionNum(int shuffleId) {
+    return 16;
+  }
+
+  @Override
+  public int getNumMaps(int shuffleId) {
+    return 8;
+  }
+
+  @Override
+  public void unregisterAllMapOutput(int shuffleId) {
+    unregisteredShuffleIds.add(shuffleId);
   }
 }

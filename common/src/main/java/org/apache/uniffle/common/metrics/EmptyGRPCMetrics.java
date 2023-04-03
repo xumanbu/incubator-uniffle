@@ -15,30 +15,10 @@
  * limitations under the License.
  */
 
-package org.apache.spark.shuffle;
+package org.apache.uniffle.common.metrics;
 
-import java.util.Map;
-import java.util.Set;
-
-import org.apache.commons.lang3.SystemUtils;
-import org.apache.spark.SparkConf;
-import org.apache.spark.shuffle.writer.DataPusher;
-
-public class TestUtils {
-
-  private TestUtils() {
-  }
-
-  public static RssShuffleManager createShuffleManager(
-      SparkConf conf,
-      Boolean isDriver,
-      DataPusher dataPusher,
-      Map<String, Set<Long>> successBlockIds,
-      Map<String, Set<Long>> failBlockIds) {
-    return new RssShuffleManager(conf, isDriver, dataPusher, successBlockIds, failBlockIds);
-  }
-
-  public static boolean isMacOnAppleSilicon() {
-    return SystemUtils.IS_OS_MAC_OSX && SystemUtils.OS_ARCH.equals("aarch64");
+public class EmptyGRPCMetrics extends GRPCMetrics {
+  @Override
+  public void registerMetrics() {
   }
 }

@@ -15,30 +15,29 @@
  * limitations under the License.
  */
 
-package org.apache.spark.shuffle;
+package org.apache.uniffle.client.factory;
 
-import java.util.Map;
-import java.util.Set;
+import org.apache.uniffle.client.impl.grpc.ShuffleManagerGrpcClient;
+import org.apache.uniffle.common.ClientType;
 
-import org.apache.commons.lang3.SystemUtils;
-import org.apache.spark.SparkConf;
-import org.apache.spark.shuffle.writer.DataPusher;
+public class ShuffleManagerClientFactory {
 
-public class TestUtils {
-
-  private TestUtils() {
+  private static class LazyHolder {
+    private static final ShuffleManagerClientFactory INSTANCE = new ShuffleManagerClientFactory();
   }
 
-  public static RssShuffleManager createShuffleManager(
-      SparkConf conf,
-      Boolean isDriver,
-      DataPusher dataPusher,
-      Map<String, Set<Long>> successBlockIds,
-      Map<String, Set<Long>> failBlockIds) {
-    return new RssShuffleManager(conf, isDriver, dataPusher, successBlockIds, failBlockIds);
+  public static ShuffleManagerClientFactory getInstance() {
+    return LazyHolder.INSTANCE;
   }
 
-  public static boolean isMacOnAppleSilicon() {
-    return SystemUtils.IS_OS_MAC_OSX && SystemUtils.OS_ARCH.equals("aarch64");
+  private ShuffleManagerClientFactory() {
+  }
+
+  public ShuffleManagerGrpcClient createShuffleManagerClient(ClientType clientType, String host, int port) {
+    if (ClientType.GRPC.equals(clientType)) {
+      return new ShuffleManagerGrpcClient(host, port);
+    } else {
+      throw new UnsupportedOperationException("Unsupported client type " + clientType);
+    }
   }
 }
