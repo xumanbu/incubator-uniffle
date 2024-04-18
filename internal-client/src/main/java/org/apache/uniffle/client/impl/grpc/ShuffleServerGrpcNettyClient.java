@@ -86,6 +86,17 @@ public class ShuffleServerGrpcNettyClient extends ShuffleServerGrpcClient {
   }
 
   @Override
+  public String getClientInfo() {
+    return "ShuffleServerGrpcNettyClient for host["
+        + host
+        + "], port["
+        + port
+        + "], nettyPort["
+        + nettyPort
+        + "]";
+  }
+
+  @Override
   public RssSendShuffleDataResponse sendShuffleData(RssSendShuffleDataRequest request) {
     Map<Integer, Map<Integer, List<ShuffleBlockInfo>>> shuffleIdToBlocks =
         request.getShuffleIdToBlocks();
@@ -103,12 +114,20 @@ public class ShuffleServerGrpcNettyClient extends ShuffleServerGrpcClient {
         }
       }
 
-      int allocateSize = size;
+      SendShuffleDataRequest sendShuffleDataRequest =
+          new SendShuffleDataRequest(
+              requestId(),
+              request.getAppId(),
+              shuffleId,
+              0L,
+              stb.getValue(),
+              System.currentTimeMillis());
+      int allocateSize = size + sendShuffleDataRequest.encodedLength();
       int finalBlockNum = blockNum;
       try {
         RetryUtils.retryWithCondition(
             () -> {
-              TransportClient transportClient = getTransportClient();
+              final TransportClient transportClient = getTransportClient();
               long requireId =
                   requirePreAllocation(
                       request.getAppId(),
@@ -121,15 +140,8 @@ public class ShuffleServerGrpcNettyClient extends ShuffleServerGrpcClient {
                         "requirePreAllocation failed! size[%s], host[%s], port[%s]",
                         allocateSize, host, port));
               }
-
-              SendShuffleDataRequest sendShuffleDataRequest =
-                  new SendShuffleDataRequest(
-                      requestId(),
-                      request.getAppId(),
-                      shuffleId,
-                      requireId,
-                      stb.getValue(),
-                      System.currentTimeMillis());
+              sendShuffleDataRequest.setRequireId(requireId);
+              sendShuffleDataRequest.setTimestamp(System.currentTimeMillis());
               long start = System.currentTimeMillis();
               RpcResponse rpcResponse =
                   transportClient.sendRpcSync(sendShuffleDataRequest, rpcTimeout);
@@ -209,12 +221,27 @@ public class ShuffleServerGrpcNettyClient extends ShuffleServerGrpcClient {
             + "], lastBlockId["
             + request.getLastBlockId()
             + "]";
-    RpcResponse rpcResponse = transportClient.sendRpcSync(getMemoryShuffleDataRequest, rpcTimeout);
-    GetMemoryShuffleDataResponse getMemoryShuffleDataResponse =
-        (GetMemoryShuffleDataResponse) rpcResponse;
-    StatusCode statusCode = rpcResponse.getStatusCode();
-    switch (statusCode) {
+    long start = System.currentTimeMillis();
+    int retry = 0;
+    RpcResponse rpcResponse;
+    GetMemoryShuffleDataResponse getMemoryShuffleDataResponse;
+    while (true) {
+      rpcResponse = transportClient.sendRpcSync(getMemoryShuffleDataRequest, rpcTimeout);
+      getMemoryShuffleDataResponse = (GetMemoryShuffleDataResponse) rpcResponse;
+      if (rpcResponse.getStatusCode() != StatusCode.NO_BUFFER) {
+        break;
+      }
+      waitOrThrow(request, retry, requestInfo, rpcResponse.getStatusCode(), start);
+      retry++;
+    }
+    switch (rpcResponse.getStatusCode()) {
       case SUCCESS:
+        LOG.info(
+            "GetInMemoryShuffleData from {}:{} for {} cost {} ms",
+            host,
+            nettyPort,
+            requestInfo,
+            System.currentTimeMillis() - start);
         return new RssGetInMemoryShuffleDataResponse(
             StatusCode.SUCCESS,
             getMemoryShuffleDataResponse.body(),
@@ -224,7 +251,7 @@ public class ShuffleServerGrpcNettyClient extends ShuffleServerGrpcClient {
             "Can't get shuffle in memory data from "
                 + host
                 + ":"
-                + port
+                + nettyPort
                 + " for "
                 + requestInfo
                 + ", errorMsg:"
@@ -245,8 +272,6 @@ public class ShuffleServerGrpcNettyClient extends ShuffleServerGrpcClient {
             request.getPartitionId(),
             request.getPartitionNumPerRange(),
             request.getPartitionNum());
-    long start = System.currentTimeMillis();
-    RpcResponse rpcResponse = transportClient.sendRpcSync(getLocalShuffleIndexRequest, rpcTimeout);
     String requestInfo =
         "appId["
             + request.getAppId()
@@ -254,17 +279,27 @@ public class ShuffleServerGrpcNettyClient extends ShuffleServerGrpcClient {
             + request.getShuffleId()
             + "], partitionId["
             + request.getPartitionId();
-    LOG.info(
-        "GetShuffleIndex from {}:{} for {} cost {} ms",
-        host,
-        port,
-        requestInfo,
-        System.currentTimeMillis() - start);
-    GetLocalShuffleIndexResponse getLocalShuffleIndexResponse =
-        (GetLocalShuffleIndexResponse) rpcResponse;
-    StatusCode statusCode = rpcResponse.getStatusCode();
-    switch (statusCode) {
+    long start = System.currentTimeMillis();
+    int retry = 0;
+    RpcResponse rpcResponse;
+    GetLocalShuffleIndexResponse getLocalShuffleIndexResponse;
+    while (true) {
+      rpcResponse = transportClient.sendRpcSync(getLocalShuffleIndexRequest, rpcTimeout);
+      getLocalShuffleIndexResponse = (GetLocalShuffleIndexResponse) rpcResponse;
+      if (rpcResponse.getStatusCode() != StatusCode.NO_BUFFER) {
+        break;
+      }
+      waitOrThrow(request, retry, requestInfo, rpcResponse.getStatusCode(), start);
+      retry++;
+    }
+    switch (rpcResponse.getStatusCode()) {
       case SUCCESS:
+        LOG.info(
+            "GetShuffleIndex from {}:{} for {} cost {} ms",
+            host,
+            nettyPort,
+            requestInfo,
+            System.currentTimeMillis() - start);
         return new RssGetShuffleIndexResponse(
             StatusCode.SUCCESS,
             getLocalShuffleIndexResponse.body(),
@@ -274,7 +309,7 @@ public class ShuffleServerGrpcNettyClient extends ShuffleServerGrpcClient {
             "Can't get shuffle index from "
                 + host
                 + ":"
-                + port
+                + nettyPort
                 + " for "
                 + requestInfo
                 + ", errorMsg:"
@@ -298,8 +333,6 @@ public class ShuffleServerGrpcNettyClient extends ShuffleServerGrpcClient {
             request.getOffset(),
             request.getLength(),
             System.currentTimeMillis());
-    long start = System.currentTimeMillis();
-    RpcResponse rpcResponse = transportClient.sendRpcSync(getLocalShuffleIndexRequest, rpcTimeout);
     String requestInfo =
         "appId["
             + request.getAppId()
@@ -308,17 +341,27 @@ public class ShuffleServerGrpcNettyClient extends ShuffleServerGrpcClient {
             + "], partitionId["
             + request.getPartitionId()
             + "]";
-    LOG.info(
-        "GetShuffleData from {}:{} for {} cost {} ms",
-        host,
-        port,
-        requestInfo,
-        System.currentTimeMillis() - start);
-    GetLocalShuffleDataResponse getLocalShuffleDataResponse =
-        (GetLocalShuffleDataResponse) rpcResponse;
-    StatusCode statusCode = rpcResponse.getStatusCode();
-    switch (statusCode) {
+    long start = System.currentTimeMillis();
+    int retry = 0;
+    RpcResponse rpcResponse;
+    GetLocalShuffleDataResponse getLocalShuffleDataResponse;
+    while (true) {
+      rpcResponse = transportClient.sendRpcSync(getLocalShuffleIndexRequest, rpcTimeout);
+      getLocalShuffleDataResponse = (GetLocalShuffleDataResponse) rpcResponse;
+      if (rpcResponse.getStatusCode() != StatusCode.NO_BUFFER) {
+        break;
+      }
+      waitOrThrow(request, retry, requestInfo, rpcResponse.getStatusCode(), start);
+      retry++;
+    }
+    switch (rpcResponse.getStatusCode()) {
       case SUCCESS:
+        LOG.info(
+            "GetShuffleData from {}:{} for {} cost {} ms",
+            host,
+            nettyPort,
+            requestInfo,
+            System.currentTimeMillis() - start);
         return new RssGetShuffleDataResponse(
             StatusCode.SUCCESS, getLocalShuffleDataResponse.body());
       default:
@@ -326,7 +369,7 @@ public class ShuffleServerGrpcNettyClient extends ShuffleServerGrpcClient {
             "Can't get shuffle data from "
                 + host
                 + ":"
-                + port
+                + nettyPort
                 + " for "
                 + requestInfo
                 + ", errorMsg:"

@@ -45,7 +45,6 @@ impl MemoryStoreConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 pub struct HdfsStoreConfig {
-    pub data_path: String,
     pub max_concurrency: Option<i32>,
 }
 
@@ -88,8 +87,8 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         RuntimeConfig {
             read_thread_num: 10,
-            write_thread_num: 10,
-            grpc_thread_num: 20,
+            write_thread_num: 40,
+            grpc_thread_num: 100,
             http_thread_num: 5,
             default_thread_num: 5,
         }

@@ -46,12 +46,12 @@ import org.apache.spark.shuffle.RssSparkConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.uniffle.client.util.ClientUtils;
 import org.apache.uniffle.common.ShuffleBlockInfo;
 import org.apache.uniffle.common.ShuffleServerInfo;
 import org.apache.uniffle.common.compression.Codec;
 import org.apache.uniffle.common.config.RssConf;
 import org.apache.uniffle.common.exception.RssException;
+import org.apache.uniffle.common.util.BlockIdLayout;
 import org.apache.uniffle.common.util.ChecksumUtils;
 
 public class WriteBufferManager extends MemoryConsumer {
@@ -65,6 +65,8 @@ public class WriteBufferManager extends MemoryConsumer {
   private AtomicLong usedBytes = new AtomicLong(0);
   // bytes of shuffle data which is in send list
   private AtomicLong inSendListBytes = new AtomicLong(0);
+  /** An atomic counter used to keep track of the number of records */
+  private AtomicLong recordCounter = new AtomicLong(0);
   // it's part of blockId
   private Map<Integer, Integer> partitionToSeqNo = Maps.newHashMap();
   private long askExecutorMemory;
@@ -95,6 +97,7 @@ public class WriteBufferManager extends MemoryConsumer {
   private boolean memorySpillEnabled;
   private int memorySpillTimeoutSec;
   private boolean isRowBased;
+  private BlockIdLayout blockIdLayout;
 
   public WriteBufferManager(
       int shuffleId,
@@ -160,6 +163,7 @@ public class WriteBufferManager extends MemoryConsumer {
     this.sendSizeLimit = rssConf.get(RssSparkConfig.RSS_CLIENT_SEND_SIZE_LIMITATION);
     this.memorySpillTimeoutSec = rssConf.get(RssSparkConfig.RSS_MEMORY_SPILL_TIMEOUT);
     this.memorySpillEnabled = rssConf.get(RssSparkConfig.RSS_MEMORY_SPILL_ENABLED);
+    this.blockIdLayout = BlockIdLayout.from(rssConf);
   }
 
   /** add serialized columnar data directly when integrate with gluten */
@@ -201,39 +205,25 @@ public class WriteBufferManager extends MemoryConsumer {
     // this may trigger current WriteBufferManager spill method, which will
     // make the current write buffer discard. So we have to recheck the buffer existence.
     boolean hasRequested = false;
-    if (buffers.containsKey(partitionId)) {
-      WriterBuffer wb = buffers.get(partitionId);
+    WriterBuffer wb = buffers.get(partitionId);
+    if (wb != null) {
       if (wb.askForMemory(serializedDataLength)) {
         requestMemory(required);
         hasRequested = true;
       }
     }
 
-    if (buffers.containsKey(partitionId)) {
+    // hasRequested is not true means spill method was not trigger,
+    // and we don't have to recheck the buffer existence in this case.
+    if (hasRequested) {
+      wb = buffers.get(partitionId);
+    }
+
+    if (wb != null) {
       if (hasRequested) {
         usedBytes.addAndGet(required);
       }
-      WriterBuffer wb = buffers.get(partitionId);
       wb.addRecord(serializedData, serializedDataLength);
-      if (wb.getMemoryUsed() > bufferSize) {
-        List<ShuffleBlockInfo> sentBlocks = new ArrayList<>(1);
-        sentBlocks.add(createShuffleBlock(partitionId, wb));
-        copyTime += wb.getCopyTime();
-        buffers.remove(partitionId);
-        if (LOG.isDebugEnabled()) {
-          LOG.debug(
-              "Single buffer is full for shuffleId["
-                  + shuffleId
-                  + "] partition["
-                  + partitionId
-                  + "] with memoryUsed["
-                  + wb.getMemoryUsed()
-                  + "], dataLength["
-                  + wb.getDataLength()
-                  + "]");
-        }
-        return sentBlocks;
-      }
     } else {
       // The true of hasRequested means the former partitioned buffer has been flushed, that is
       // triggered by the spill operation caused by asking for memory. So it needn't to re-request
@@ -242,10 +232,30 @@ public class WriteBufferManager extends MemoryConsumer {
         requestMemory(required);
       }
       usedBytes.addAndGet(required);
-
-      WriterBuffer wb = new WriterBuffer(bufferSegmentSize);
+      wb = new WriterBuffer(bufferSegmentSize);
       wb.addRecord(serializedData, serializedDataLength);
       buffers.put(partitionId, wb);
+    }
+
+    if (wb.getMemoryUsed() > bufferSize) {
+      List<ShuffleBlockInfo> sentBlocks = new ArrayList<>(1);
+      sentBlocks.add(createShuffleBlock(partitionId, wb));
+      recordCounter.addAndGet(wb.getRecordCount());
+      copyTime += wb.getCopyTime();
+      buffers.remove(partitionId);
+      if (LOG.isDebugEnabled()) {
+        LOG.debug(
+            "Single buffer is full for shuffleId["
+                + shuffleId
+                + "] partition["
+                + partitionId
+                + "] with memoryUsed["
+                + wb.getMemoryUsed()
+                + "], dataLength["
+                + wb.getDataLength()
+                + "]");
+      }
+      return sentBlocks;
     }
     return Collections.emptyList();
   }
@@ -293,6 +303,7 @@ public class WriteBufferManager extends MemoryConsumer {
       dataSize += wb.getDataLength();
       memoryUsed += wb.getMemoryUsed();
       result.add(createShuffleBlock(entry.getKey(), wb));
+      recordCounter.addAndGet(wb.getRecordCount());
       iterator.remove();
       copyTime += wb.getCopyTime();
     }
@@ -321,7 +332,7 @@ public class WriteBufferManager extends MemoryConsumer {
     }
     final long crc32 = ChecksumUtils.getCrc32(compressed);
     final long blockId =
-        ClientUtils.getBlockId(partitionId, taskAttemptId, getNextSeqNo(partitionId));
+        blockIdLayout.getBlockId(getNextSeqNo(partitionId), partitionId, taskAttemptId);
     uncompressedDataLen += data.length;
     shuffleWriteMetrics.incBytesWritten(compressed.length);
     // add memory to indicate bytes which will be sent to shuffle server
@@ -397,14 +408,18 @@ public class WriteBufferManager extends MemoryConsumer {
     }
   }
 
+  public void releaseBlockResource(ShuffleBlockInfo block) {
+    this.freeAllocatedMemory(block.getFreeMemory());
+    block.getData().release();
+  }
+
   public List<AddBlockEvent> buildBlockEvents(List<ShuffleBlockInfo> shuffleBlockInfoList) {
     long totalSize = 0;
-    long memoryUsed = 0;
     List<AddBlockEvent> events = new ArrayList<>();
     List<ShuffleBlockInfo> shuffleBlockInfosPerEvent = Lists.newArrayList();
     for (ShuffleBlockInfo sbi : shuffleBlockInfoList) {
+      sbi.withCompletionCallback((block, isSuccessful) -> this.releaseBlockResource(block));
       totalSize += sbi.getSize();
-      memoryUsed += sbi.getFreeMemory();
       shuffleBlockInfosPerEvent.add(sbi);
       // split shuffle data according to the size
       if (totalSize > sendSizeLimit) {
@@ -416,20 +431,9 @@ public class WriteBufferManager extends MemoryConsumer {
                   + totalSize
                   + " bytes");
         }
-        // Use final temporary variables for closures
-        final long memoryUsedTemp = memoryUsed;
-        final List<ShuffleBlockInfo> shuffleBlocksTemp = shuffleBlockInfosPerEvent;
-        events.add(
-            new AddBlockEvent(
-                taskId,
-                shuffleBlockInfosPerEvent,
-                () -> {
-                  freeAllocatedMemory(memoryUsedTemp);
-                  shuffleBlocksTemp.stream().forEach(x -> x.getData().release());
-                }));
+        events.add(new AddBlockEvent(taskId, shuffleBlockInfosPerEvent));
         shuffleBlockInfosPerEvent = Lists.newArrayList();
         totalSize = 0;
-        memoryUsed = 0;
       }
     }
     if (!shuffleBlockInfosPerEvent.isEmpty()) {
@@ -442,16 +446,7 @@ public class WriteBufferManager extends MemoryConsumer {
                 + " bytes");
       }
       // Use final temporary variables for closures
-      final long memoryUsedTemp = memoryUsed;
-      final List<ShuffleBlockInfo> shuffleBlocksTemp = shuffleBlockInfosPerEvent;
-      events.add(
-          new AddBlockEvent(
-              taskId,
-              shuffleBlockInfosPerEvent,
-              () -> {
-                freeAllocatedMemory(memoryUsedTemp);
-                shuffleBlocksTemp.stream().forEach(x -> x.getData().release());
-              }));
+      events.add(new AddBlockEvent(taskId, shuffleBlockInfosPerEvent));
     }
     return events;
   }
@@ -471,6 +466,9 @@ public class WriteBufferManager extends MemoryConsumer {
     } catch (TimeoutException timeoutException) {
       // A best effort strategy to wait.
       // If timeout exception occurs, the underlying tasks won't be cancelled.
+      LOG.warn("[taskId: {}] Spill tasks timeout after {} seconds", taskId, memorySpillTimeoutSec);
+    } catch (Exception e) {
+      LOG.warn("[taskId: {}] Failed to spill buffers due to ", taskId, e);
     } finally {
       long releasedSize =
           futures.stream()
@@ -503,6 +501,10 @@ public class WriteBufferManager extends MemoryConsumer {
   @VisibleForTesting
   protected long getInSendListBytes() {
     return inSendListBytes.get();
+  }
+
+  protected long getRecordCount() {
+    return recordCounter.get();
   }
 
   public void freeAllocatedMemory(long freeMemory) {

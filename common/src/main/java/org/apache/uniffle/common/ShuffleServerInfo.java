@@ -21,6 +21,8 @@ import java.io.Serializable;
 import java.util.List;
 import java.util.stream.Collectors;
 
+import com.google.common.annotations.VisibleForTesting;
+
 import org.apache.uniffle.proto.RssProtos;
 
 public class ShuffleServerInfo implements Serializable {
@@ -33,11 +35,19 @@ public class ShuffleServerInfo implements Serializable {
 
   private int nettyPort = -1;
 
-  // Only for test
+  @VisibleForTesting
   public ShuffleServerInfo(String host, int port) {
     this.id = host + "-" + port;
     this.host = host;
     this.grpcPort = port;
+  }
+
+  @VisibleForTesting
+  public ShuffleServerInfo(String host, int grpcPort, int nettyPort) {
+    this.id = host + "-" + grpcPort + "-" + nettyPort;
+    this.host = host;
+    this.grpcPort = grpcPort;
+    this.nettyPort = nettyPort;
   }
 
   public ShuffleServerInfo(String id, String host, int port) {
@@ -100,19 +110,22 @@ public class ShuffleServerInfo implements Serializable {
           + nettyPort
           + "]}";
     } else {
-      return "ShuffleServerInfo{host[" + host + "]," + " grpc port[" + grpcPort + "]}";
+      return "ShuffleServerInfo{host[" + host + "], grpc port[" + grpcPort + "]}";
     }
   }
 
-  private static ShuffleServerInfo convertToShuffleServerId(
+  private static ShuffleServerInfo convertFromShuffleServerId(
       RssProtos.ShuffleServerId shuffleServerId) {
     ShuffleServerInfo shuffleServerInfo =
         new ShuffleServerInfo(
-            shuffleServerId.getId(), shuffleServerId.getIp(), shuffleServerId.getPort(), 0);
+            shuffleServerId.getId(),
+            shuffleServerId.getIp(),
+            shuffleServerId.getPort(),
+            shuffleServerId.getNettyPort());
     return shuffleServerInfo;
   }
 
-  private static RssProtos.ShuffleServerId convertToShuffleServerId(
+  public static RssProtos.ShuffleServerId convertToShuffleServerId(
       ShuffleServerInfo shuffleServerInfo) {
     RssProtos.ShuffleServerId shuffleServerId =
         RssProtos.ShuffleServerId.newBuilder()
@@ -126,7 +139,7 @@ public class ShuffleServerInfo implements Serializable {
 
   public static List<ShuffleServerInfo> fromProto(List<RssProtos.ShuffleServerId> servers) {
     return servers.stream()
-        .map(server -> convertToShuffleServerId(server))
+        .map(server -> convertFromShuffleServerId(server))
         .collect(Collectors.toList());
   }
 

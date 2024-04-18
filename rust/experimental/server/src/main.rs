@@ -17,7 +17,7 @@
 
 #![feature(impl_trait_in_assoc_type)]
 
-use crate::app::{AppManager, AppManagerRef};
+use crate::app::{AppManager, AppManagerRef, SHUFFLE_SERVER_ID};
 use crate::await_tree::AWAIT_TREE_REGISTRY;
 use crate::config::{Config, LogConfig, RotationConfig};
 use crate::grpc::await_tree_middleware::AwaitTreeMiddlewareLayer;
@@ -201,6 +201,8 @@ fn main() -> Result<()> {
 
     let rpc_port = config.grpc_port.unwrap_or(19999);
     let worker_uid = gen_worker_uid(rpc_port);
+    // todo: remove some unnecessary worker_id transfer.
+    SHUFFLE_SERVER_ID.get_or_init(|| worker_uid.clone());
 
     let metric_config = config.metrics.clone();
     init_metric_service(runtime_manager.clone(), &metric_config, worker_uid.clone());
@@ -238,13 +240,9 @@ fn main() -> Result<()> {
             .max_decoding_message_size(usize::MAX)
             .max_encoding_message_size(usize::MAX);
         let service_tx = tx.subscribe();
-        runtime_manager.grpc_runtime.spawn_blocking(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(grpc_serve(service, addr, service_tx));
-        });
+        runtime_manager
+            .grpc_runtime
+            .spawn(async move { grpc_serve(service, addr, service_tx).await });
     }
 
     graceful_wait_for_signal(tx);

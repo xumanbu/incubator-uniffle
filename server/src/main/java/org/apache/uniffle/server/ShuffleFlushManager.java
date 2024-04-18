@@ -81,7 +81,8 @@ public class ShuffleFlushManager {
     storageBasePaths = RssUtils.getConfiguredLocalDirs(shuffleServerConf);
     pendingEventTimeoutSec = shuffleServerConf.getLong(ShuffleServerConf.PENDING_EVENT_TIMEOUT_SEC);
     eventHandler =
-        new DefaultFlushEventHandler(shuffleServerConf, storageManager, this::processFlushEvent);
+        new DefaultFlushEventHandler(
+            shuffleServerConf, storageManager, shuffleServer, this::processFlushEvent);
   }
 
   public void addToFlushQueue(ShuffleDataFlushEvent event) {
@@ -110,7 +111,7 @@ public class ShuffleFlushManager {
       }
 
       if (reachRetryMax(event)) {
-        LOG.warn("The event:{] has been reached to max retry times, it will be dropped.", event);
+        LOG.error("The event:{} has been reached to max retry times, it will be dropped.", event);
         throw new EventDiscardException();
       }
 

@@ -1,3 +1,5 @@
+#!/bin/bash
+
 #
 # Licensed to the Apache Software Foundation (ASF) under one or more
 # contributor license agreements.  See the NOTICE file distributed with
@@ -15,8 +17,25 @@
 # limitations under the License.
 #
 
-log4j.rootLogger=info,stdout
-log4j.threshhold=ALL
-log4j.appender.stdout=org.apache.log4j.ConsoleAppender
-log4j.appender.stdout.layout=org.apache.log4j.PatternLayout
-log4j.appender.stdout.layout.ConversionPattern=%d{ISO8601} %-5p [%t] %c{2} (%F:%M(%L)) - %m%n
+basedir='/data/rssadmin/rss'
+cd $basedir || exit
+
+coordinator_conf=$basedir'/conf/coordinator.conf'
+echo "coordinator_conf: $coordinator_conf"
+server_conf=$basedir'/conf/server.conf'
+echo "server_conf: $server_conf"
+
+if [ "$SERVICE_NAME" == "coordinator" ];then
+    start_script=${basedir}'/bin/start-coordinator.sh'
+    log_file=$basedir'/logs/coordinator.log'
+fi
+
+if [ "$SERVICE_NAME" == "server" ];then
+    start_script=${basedir}'/bin/start-shuffle-server.sh'
+    log_file=$basedir'/logs/shuffle_server.log'
+fi
+
+touch "${log_file}"
+${start_script} | grep -v "class path is"
+echo
+tail -n +0 -f "${log_file}"

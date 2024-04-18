@@ -25,6 +25,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Queues;
+import com.google.common.collect.Sets;
 import org.apache.hadoop.conf.Configuration;
 import org.roaringbitmap.longlong.Roaring64NavigableMap;
 import org.slf4j.Logger;
@@ -41,6 +42,7 @@ import org.apache.uniffle.common.ShuffleServerInfo;
 import org.apache.uniffle.common.config.RssClientConf;
 import org.apache.uniffle.common.config.RssConf;
 import org.apache.uniffle.common.exception.RssFetchFailedException;
+import org.apache.uniffle.common.util.BlockIdLayout;
 import org.apache.uniffle.common.util.ChecksumUtils;
 import org.apache.uniffle.common.util.IdHelper;
 import org.apache.uniffle.common.util.RssUtils;
@@ -66,19 +68,27 @@ public class ShuffleReadClientImpl implements ShuffleReadClient {
   private AtomicLong crcCheckTime = new AtomicLong(0);
   private ClientReadHandler clientReadHandler;
   private IdHelper idHelper;
+  private BlockIdLayout blockIdLayout;
 
   public ShuffleReadClientImpl(ShuffleClientFactory.ReadClientBuilder builder) {
     // add default value
-    if (builder.getIdHelper() == null) {
-      builder.idHelper(new DefaultIdHelper());
-    }
     if (builder.getShuffleDataDistributionType() == null) {
       builder.shuffleDataDistributionType(ShuffleDataDistributionType.NORMAL);
     }
     if (builder.getHadoopConf() == null) {
       builder.hadoopConf(new Configuration());
     }
-    if (builder.getRssConf() != null) {
+    if (builder.getRssConf() != null
+        &&
+        // if rssConf contains only block id config, consider this as test mode as well
+        !builder
+            .getRssConf()
+            .getKeySet()
+            .equals(
+                Sets.newHashSet(
+                    RssClientConf.BLOCKID_SEQUENCE_NO_BITS.key(),
+                    RssClientConf.BLOCKID_PARTITION_ID_BITS.key(),
+                    RssClientConf.BLOCKID_TASK_ATTEMPT_ID_BITS.key()))) {
       final int indexReadLimit = builder.getRssConf().get(RssClientConf.RSS_INDEX_READ_LIMIT);
       final String storageType = builder.getRssConf().get(RssClientConf.RSS_STORAGE_TYPE);
       long readBufferSize =
@@ -100,16 +110,31 @@ public class ShuffleReadClientImpl implements ShuffleReadClient {
       builder.clientType(builder.getRssConf().get(RssClientConf.RSS_CLIENT_TYPE));
     } else {
       // most for test
-      RssConf rssConf = new RssConf();
+      RssConf rssConf = (builder.getRssConf() == null) ? new RssConf() : builder.getRssConf();
       rssConf.set(RssClientConf.RSS_STORAGE_TYPE, builder.getStorageType());
       rssConf.set(RssClientConf.RSS_INDEX_READ_LIMIT, builder.getIndexReadLimit());
       rssConf.set(
           RssClientConf.RSS_CLIENT_READ_BUFFER_SIZE, String.valueOf(builder.getReadBufferSize()));
+      if (!rssConf.contains(RssClientConf.BLOCKID_SEQUENCE_NO_BITS)) {
+        rssConf.setInteger(
+            RssClientConf.BLOCKID_SEQUENCE_NO_BITS, BlockIdLayout.DEFAULT.sequenceNoBits);
+      }
+      if (!rssConf.contains(RssClientConf.BLOCKID_PARTITION_ID_BITS)) {
+        rssConf.setInteger(
+            RssClientConf.BLOCKID_PARTITION_ID_BITS, BlockIdLayout.DEFAULT.partitionIdBits);
+      }
+      if (!rssConf.contains(RssClientConf.BLOCKID_TASK_ATTEMPT_ID_BITS)) {
+        rssConf.setInteger(
+            RssClientConf.BLOCKID_TASK_ATTEMPT_ID_BITS, BlockIdLayout.DEFAULT.taskAttemptIdBits);
+      }
 
       builder.rssConf(rssConf);
       builder.offHeapEnable(false);
       builder.expectedTaskIdsBitmapFilterEnable(false);
       builder.clientType(rssConf.get(RssClientConf.RSS_CLIENT_TYPE));
+    }
+    if (builder.getIdHelper() == null) {
+      builder.idHelper(new DefaultIdHelper(BlockIdLayout.from(builder.getRssConf())));
     }
 
     init(builder);
@@ -122,6 +147,7 @@ public class ShuffleReadClientImpl implements ShuffleReadClient {
     this.taskIdBitmap = builder.getTaskIdBitmap();
     this.idHelper = builder.getIdHelper();
     this.shuffleServerInfoList = builder.getShuffleServerInfoList();
+    this.blockIdLayout = BlockIdLayout.from(builder.getRssConf());
 
     CreateShuffleReadHandlerRequest request = new CreateShuffleReadHandlerRequest();
     request.setStorageType(builder.getStorageType());
@@ -142,6 +168,8 @@ public class ShuffleReadClientImpl implements ShuffleReadClient {
     request.setExpectTaskIds(taskIdBitmap);
     request.setClientConf(builder.getRssConf());
     request.setClientType(builder.getClientType());
+    request.setRetryMax(builder.getRetryMax());
+    request.setRetryIntervalMax(builder.getRetryIntervalMax());
     if (builder.isExpectedTaskIdsBitmapFilterEnable()) {
       request.useExpectedTaskIdsBitmapFilter();
     }
@@ -211,14 +239,14 @@ public class ShuffleReadClientImpl implements ShuffleReadClient {
             actualCrc = ChecksumUtils.getCrc32(readBuffer, bs.getOffset(), bs.getLength());
             crcCheckTime.addAndGet(System.currentTimeMillis() - start);
           } catch (Exception e) {
-            LOG.warn("Can't read data for blockId[" + bs.getBlockId() + "]", e);
+            LOG.warn("Can't read data for " + blockIdLayout.asBlockId(bs.getBlockId()), e);
           }
 
           if (expectedCrc != actualCrc) {
             String errMsg =
-                "Unexpected crc value for blockId["
-                    + bs.getBlockId()
-                    + "], expected:"
+                "Unexpected crc value for "
+                    + blockIdLayout.asBlockId(bs.getBlockId())
+                    + ", expected:"
                     + expectedCrc
                     + ", actual:"
                     + actualCrc;
@@ -269,6 +297,10 @@ public class ShuffleReadClientImpl implements ShuffleReadClient {
     // because PlatformDependent.freeDirectBuffer can only release the ByteBuffer with cleaner.
     if (sdr != null) {
       sdr.release();
+      // We set sdr to null here to prevent IllegalReferenceCountException that could occur
+      // if sdr.release() is called multiple times in the close() method,
+      // when an exception is thrown by clientReadHandler.readShuffleData().
+      sdr = null;
     }
     sdr = clientReadHandler.readShuffleData();
     readDataTime.addAndGet(System.currentTimeMillis() - start);

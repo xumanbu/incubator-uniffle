@@ -53,6 +53,7 @@ import org.apache.uniffle.common.ShuffleServerInfo;
 import org.apache.uniffle.common.compression.Codec;
 import org.apache.uniffle.common.config.RssConf;
 import org.apache.uniffle.common.exception.RssException;
+import org.apache.uniffle.common.util.BlockIdLayout;
 import org.apache.uniffle.common.util.ChecksumUtils;
 import org.apache.uniffle.common.util.ThreadUtils;
 
@@ -86,13 +87,16 @@ public class WriteBufferManager<K, V> {
   private final Codec codec;
   private final Map<Integer, List<ShuffleServerInfo>> partitionToServers;
   private final Set<Long> allBlockIds = Sets.newConcurrentHashSet();
-  private final Map<Integer, List<Long>> partitionToBlocks = Maps.newConcurrentMap();
+  // server -> partitionId -> blockIds
+  private Map<ShuffleServerInfo, Map<Integer, Set<Long>>> serverToPartitionToBlockIds =
+      Maps.newConcurrentMap();
   private final int numMaps;
   private final boolean isMemoryShuffleEnabled;
   private final long sendCheckInterval;
   private final long sendCheckTimeout;
   private final int bitmapSplitNum;
   private final long taskAttemptId;
+  private final BlockIdLayout blockIdLayout;
   private TezTaskAttemptID tezTaskAttemptID;
   private final RssConf rssConf;
   private final int shuffleId;
@@ -133,6 +137,7 @@ public class WriteBufferManager<K, V> {
     this.maxMemSize = maxMemSize;
     this.appId = appId;
     this.taskAttemptId = taskAttemptId;
+    this.blockIdLayout = BlockIdLayout.from(rssConf);
     this.successBlockIds = successBlockIds;
     this.failedBlockIds = failedBlockIds;
     this.shuffleWriteClient = shuffleWriteClient;
@@ -246,10 +251,17 @@ public class WriteBufferManager<K, V> {
     buffer.clear();
     shuffleBlocks.add(block);
     allBlockIds.add(block.getBlockId());
-    if (!partitionToBlocks.containsKey(block.getPartitionId())) {
-      partitionToBlocks.putIfAbsent(block.getPartitionId(), Lists.newArrayList());
-    }
-    partitionToBlocks.get(block.getPartitionId()).add(block.getBlockId());
+    block
+        .getShuffleServerInfos()
+        .forEach(
+            shuffleServerInfo -> {
+              Map<Integer, Set<Long>> pToBlockIds =
+                  serverToPartitionToBlockIds.computeIfAbsent(
+                      shuffleServerInfo, k -> Maps.newHashMap());
+              pToBlockIds
+                  .computeIfAbsent(block.getPartitionId(), v -> Sets.newHashSet())
+                  .add(block.getBlockId());
+            });
   }
 
   private void sendShuffleBlocks(List<ShuffleBlockInfo> shuffleBlocks) {
@@ -269,8 +281,8 @@ public class WriteBufferManager<K, V> {
             } catch (Throwable t) {
               LOG.warn("send shuffle data exception ", t);
             } finally {
+              memoryLock.lock();
               try {
-                memoryLock.lock();
                 if (LOG.isDebugEnabled()) {
                   LOG.debug("memoryUsedSize {} decrease {}", memoryUsedSize, size);
                 }
@@ -322,7 +334,7 @@ public class WriteBufferManager<K, V> {
     LOG.info(
         "tezVertexID is {}, tezDAGID is {}, shuffleId is {}", tezVertexID, tezDAGID, shuffleId);
     shuffleWriteClient.reportShuffleResult(
-        partitionToServers, appId, shuffleId, taskAttemptId, partitionToBlocks, bitmapSplitNum);
+        serverToPartitionToBlockIds, appId, shuffleId, taskAttemptId, bitmapSplitNum);
     LOG.info(
         "Report shuffle result for task[{}] with bitmapNum[{}] cost {} ms",
         taskAttemptId,
@@ -362,8 +374,8 @@ public class WriteBufferManager<K, V> {
     final long crc32 = ChecksumUtils.getCrc32(compressed);
     compressTime += System.currentTimeMillis() - start;
     final long blockId =
-        RssTezUtils.getBlockId((long) partitionId, taskAttemptId, getNextSeqNo(partitionId));
-    LOG.info("blockId is {}", blockId);
+        RssTezUtils.getBlockId(partitionId, taskAttemptId, getNextSeqNo(partitionId));
+    LOG.info("blockId is {}", blockIdLayout.asBlockId(blockId));
     uncompressedDataLen += data.length;
     // add memory to indicate bytes which will be sent to shuffle server
     inSendListBytes.addAndGet(wb.getDataLength());

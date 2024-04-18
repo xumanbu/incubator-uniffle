@@ -26,12 +26,12 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Supplier;
 
+import com.google.common.collect.Sets;
 import io.grpc.stub.StreamObserver;
 import org.apache.spark.shuffle.ShuffleHandleInfo;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.uniffle.common.RemoteStorageInfo;
 import org.apache.uniffle.common.ShuffleServerInfo;
 import org.apache.uniffle.common.util.JavaUtils;
 import org.apache.uniffle.proto.RssProtos;
@@ -193,37 +193,17 @@ public class ShuffleManagerGrpcService extends ShuffleManagerImplBase {
         shuffleManager.getShuffleHandleInfoByShuffleId(shuffleId);
     if (shuffleHandleInfoByShuffleId != null) {
       code = RssProtos.StatusCode.SUCCESS;
-      Map<Integer, List<ShuffleServerInfo>> partitionToServers =
-          shuffleHandleInfoByShuffleId.getPartitionToServers();
-      Map<Integer, RssProtos.GetShuffleServerListResponse> protopartitionToServers =
-          JavaUtils.newConcurrentMap();
-      for (Map.Entry<Integer, List<ShuffleServerInfo>> integerListEntry :
-          partitionToServers.entrySet()) {
-        List<RssProtos.ShuffleServerId> shuffleServerIds =
-            ShuffleServerInfo.toProto(integerListEntry.getValue());
-        RssProtos.GetShuffleServerListResponse getShuffleServerListResponse =
-            RssProtos.GetShuffleServerListResponse.newBuilder()
-                .addAllServers(shuffleServerIds)
-                .build();
-        protopartitionToServers.put(integerListEntry.getKey(), getShuffleServerListResponse);
-      }
-      RemoteStorageInfo remoteStorage = shuffleHandleInfoByShuffleId.getRemoteStorage();
-      RssProtos.RemoteStorageInfo.Builder protosRemoteStage =
-          RssProtos.RemoteStorageInfo.newBuilder()
-              .setPath(remoteStorage.getPath())
-              .putAllConfItems(remoteStorage.getConfItems());
       reply =
           RssProtos.PartitionToShuffleServerResponse.newBuilder()
               .setStatus(code)
-              .putAllPartitionToShuffleServer(protopartitionToServers)
-              .setRemoteStorageInfo(protosRemoteStage)
+              .setShuffleHandleInfo(ShuffleHandleInfo.toProto(shuffleHandleInfoByShuffleId))
               .build();
     } else {
       code = RssProtos.StatusCode.INVALID_REQUEST;
       reply =
           RssProtos.PartitionToShuffleServerResponse.newBuilder()
               .setStatus(code)
-              .putAllPartitionToShuffleServer(null)
+              .setShuffleHandleInfo(ShuffleHandleInfo.toProto(ShuffleHandleInfo.EMPTY_HANDLE_INFO))
               .build();
     }
     responseObserver.onNext(reply);
@@ -239,13 +219,32 @@ public class ShuffleManagerGrpcService extends ShuffleManagerImplBase {
     int shuffleId = request.getShuffleId();
     int numPartitions = request.getNumPartitions();
     boolean needReassign =
-        shuffleManager.reassignShuffleServers(
+        shuffleManager.reassignAllShuffleServersForWholeStage(
             stageId, stageAttemptNumber, shuffleId, numPartitions);
     RssProtos.StatusCode code = RssProtos.StatusCode.SUCCESS;
     RssProtos.ReassignServersReponse reply =
         RssProtos.ReassignServersReponse.newBuilder()
             .setStatus(code)
             .setNeedReassign(needReassign)
+            .build();
+    responseObserver.onNext(reply);
+    responseObserver.onCompleted();
+  }
+
+  @Override
+  public void reassignFaultyShuffleServer(
+      RssProtos.RssReassignFaultyShuffleServerRequest request,
+      StreamObserver<RssProtos.RssReassignFaultyShuffleServerResponse> responseObserver) {
+    ShuffleServerInfo shuffleServerInfo =
+        shuffleManager.reassignFaultyShuffleServerForTasks(
+            request.getShuffleId(),
+            Sets.newHashSet(request.getPartitionIdsList()),
+            request.getFaultyShuffleServerId());
+    RssProtos.StatusCode code = RssProtos.StatusCode.SUCCESS;
+    RssProtos.RssReassignFaultyShuffleServerResponse reply =
+        RssProtos.RssReassignFaultyShuffleServerResponse.newBuilder()
+            .setStatus(code)
+            .setServer(ShuffleServerInfo.convertToShuffleServerId(shuffleServerInfo))
             .build();
     responseObserver.onNext(reply);
     responseObserver.onCompleted();

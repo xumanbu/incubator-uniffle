@@ -83,6 +83,9 @@ jobs:
     - name: Execute `./mvnw ${{ inputs.maven-args }} -Ptez`
       run: ./mvnw -B -fae ${{ inputs.maven-args }} -Ptez | tee -a /tmp/maven.log;
       shell: bash
+    - name: Execute `./mvnw ${{ inputs.maven-args }} -Pdashboard`
+      run: ./mvnw -B -fae ${{ inputs.maven-args }} -Pdashboard | tee -a /tmp/maven.log;
+      shell: bash
     - name: Summary of failures
       if: ${{ failure() && inputs.summary != '' }}
       run: ${{ inputs.summary }}

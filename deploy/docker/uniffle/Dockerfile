@@ -15,8 +15,9 @@
 # limitations under the License.
 #
 
-log4j.rootLogger=info,stdout
-log4j.threshhold=ALL
-log4j.appender.stdout=org.apache.log4j.ConsoleAppender
-log4j.appender.stdout.layout=org.apache.log4j.PatternLayout
-log4j.appender.stdout.layout.ConversionPattern=%d{ISO8601} %-5p [%t] %c{2} (%F:%M(%L)) - %m%n
+FROM rss-server:head
+
+COPY start.sh /data/rssadmin/rss/bin
+COPY server.conf /data/rssadmin/rss/conf
+
+HEALTHCHECK --interval=3s --timeout=3s --start-period=60s CMD lsof -i:"${RPC_PORT}" -sTCP:LISTEN

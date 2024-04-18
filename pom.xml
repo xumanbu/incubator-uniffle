@@ -56,16 +56,17 @@
     <version.checksum-maven-plugin>1.11</version.checksum-maven-plugin>
     <awaitility.version>4.2.0</awaitility.version>
     <checkstyle.version>9.3</checkstyle.version>
+    <commons-collections.version>3.2.2</commons-collections.version>
     <commons-logging.version>1.2</commons-logging.version>
     <commons-lang3.version>3.10</commons-lang3.version>
     <commons-codec.version>1.9</commons-codec.version>
     <codehaus.jackson.version>1.9.13</codehaus.jackson.version>
-    <error_prone_annotations.version>2.10.0</error_prone_annotations.version>
+    <error_prone_annotations.version>2.23.0</error_prone_annotations.version>
     <execution.root>${user.dir}</execution.root>
     <fasterxml.jackson.version>2.10.0</fasterxml.jackson.version>
-    <grpc.version>1.47.0</grpc.version>
-    <gson.version>2.9.0</gson.version>
-    <guava.version>31.0.1-jre</guava.version>
+    <grpc.version>1.61.1</grpc.version>
+    <gson.version>2.10.1</gson.version>
+    <guava.version>32.1.3-jre</guava.version>
     <hadoop.scope>provided</hadoop.scope>
     <hadoop.version>2.8.5</hadoop.version>
     <httpclient.version>4.5.3</httpclient.version>
@@ -77,18 +78,18 @@
     <junit.jupiter.version>5.8.2</junit.jupiter.version>
     <junit.platform.version>1.8.2</junit.platform.version>
     <system.stubs.version>2.0.1</system.stubs.version>
-    <log4j.core.version>2.17.1</log4j.core.version>
+    <log4j.version>2.23.0</log4j.version>
     <maven-checkstyle-plugin.version>3.1.2</maven-checkstyle-plugin.version>
     <maven.compiler.source>${java.version}</maven.compiler.source>
     <maven.compiler.target>${java.version}</maven.compiler.target>
     <spotless-maven-plugin.version>2.30.0</spotless-maven-plugin.version>
     <metrics.version>3.1.0</metrics.version>
     <mockito.version>3.12.4</mockito.version>
-    <netty.version>4.1.68.Final</netty.version>
+    <netty.version>4.1.106.Final</netty.version>
     <picocli.version>4.5.2</picocli.version>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <prometheus.simpleclient.version>0.9.0</prometheus.simpleclient.version>
-    <protobuf.version>3.19.6</protobuf.version>
+    <protobuf.version>3.25.1</protobuf.version>
     <roaring.bitmap.version>0.9.15</roaring.bitmap.version>
     <rss.shade.packageName>org.apache.uniffle</rss.shade.packageName>
     <skipDeploy>false</skipDeploy>
@@ -141,7 +142,6 @@
     <module>client</module>
     <module>integration-test/common</module>
     <module>cli</module>
-    <module>dashboard</module>
   </modules>
 
   <dependencies>
@@ -149,11 +149,6 @@
       <groupId>javax.activation</groupId>
       <artifactId>activation</artifactId>
       <version>1.1.1</version>
-    </dependency>
-
-    <dependency>
-      <groupId>org.slf4j</groupId>
-      <artifactId>slf4j-reload4j</artifactId>
     </dependency>
 
     <dependency>
@@ -186,17 +181,30 @@
       <artifactId>system-stubs-jupiter</artifactId>
       <scope>test</scope>
     </dependency>
+
+    <!-- log4j2 -->
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+    </dependency>
+    <!-- Use log4j-slf4j-impl by default -->
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-slf4j-impl</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-api</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-core</artifactId>
+    </dependency>
+    <!-- end -->
   </dependencies>
 
   <dependencyManagement>
     <dependencies>
-      <dependency>
-        <groupId>org.slf4j</groupId>
-        <artifactId>slf4j-reload4j</artifactId>
-        <version>${slf4j.version}</version>
-        <scope>runtime</scope>
-      </dependency>
-
       <dependency>
         <groupId>com.google.protobuf</groupId>
         <artifactId>protobuf-java-util</artifactId>
@@ -244,16 +252,6 @@
         <groupId>io.netty</groupId>
         <artifactId>netty-all</artifactId>
         <version>${netty.version}</version>
-      </dependency>
-      <dependency>
-        <groupId>org.slf4j</groupId>
-        <artifactId>slf4j-api</artifactId>
-        <version>${slf4j.version}</version>
-      </dependency>
-      <dependency>
-        <groupId>org.apache.logging.log4j</groupId>
-        <artifactId>log4j-core</artifactId>
-        <version>${log4j.core.version}</version>
       </dependency>
       <dependency>
         <groupId>com.google.guava</groupId>
@@ -395,6 +393,10 @@
             <groupId>org.apache.httpcomponents</groupId>
             <artifactId>httpclient</artifactId>
           </exclusion>
+          <exclusion>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-log4j12</artifactId>
+          </exclusion>
         </exclusions>
       </dependency>
       <dependency>
@@ -510,6 +512,10 @@
           <exclusion>
             <groupId>org.apache.httpcomponents</groupId>
             <artifactId>httpclient</artifactId>
+          </exclusion>
+          <exclusion>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-log4j12</artifactId>
           </exclusion>
         </exclusions>
       </dependency>
@@ -640,6 +646,10 @@
             <groupId>org.apache.httpcomponents</groupId>
             <artifactId>httpclient</artifactId>
           </exclusion>
+          <exclusion>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-log4j12</artifactId>
+          </exclusion>
         </exclusions>
       </dependency>
 
@@ -737,6 +747,34 @@
         <artifactId>snakeyaml</artifactId>
         <version>${snakeyaml.version}</version>
       </dependency>
+
+      <!-- log4j -->
+      <dependency>
+        <groupId>org.slf4j</groupId>
+        <artifactId>slf4j-api</artifactId>
+        <version>${slf4j.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.logging.log4j</groupId>
+        <artifactId>log4j-slf4j-impl</artifactId>
+        <version>${log4j.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.logging.log4j</groupId>
+        <artifactId>log4j-slf4j2-impl</artifactId>
+        <version>${log4j.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.logging.log4j</groupId>
+        <artifactId>log4j-api</artifactId>
+        <version>${log4j.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.logging.log4j</groupId>
+        <artifactId>log4j-core</artifactId>
+        <version>${log4j.version}</version>
+      </dependency>
+      <!-- end -->
     </dependencies>
   </dependencyManagement>
 
@@ -793,6 +831,11 @@
               <configuration>
                 <rules>
                   <requireUpperBoundDeps/>
+                  <bannedDependencies>
+                    <excludes>
+                      <exclude>org.slf4j:slf4j-log4j12</exclude>
+                    </excludes>
+                  </bannedDependencies>
                 </rules>
               </configuration>
             </execution>
@@ -1164,6 +1207,12 @@
   </reporting>
 
   <profiles>
+    <profile>
+      <id>dashboard</id>
+      <modules>
+        <module>dashboard</module>
+      </modules>
+    </profile>
 
     <profile>
       <!-- This will search remote and local repos to generate THIRD-PARTY license file, make sure
@@ -1610,7 +1659,8 @@
         <spark.version>3.4.1</spark.version>
         <client.type>3</client.type>
         <jackson.version>2.14.2</jackson.version>
-        <log4j.core.version>2.19.0</log4j.core.version>
+        <log4j.version>2.19.0</log4j.version>
+        <slf4j.version>2.0.6</slf4j.version>
       </properties>
       <modules>
         <module>client-spark/common</module>
@@ -1692,16 +1742,30 @@
           </dependency>
         </dependencies>
       </dependencyManagement>
+      <dependencies>
+        <!-- Remove log4j-slf4j-impl dependency -->
+        <dependency>
+          <groupId>org.apache.logging.log4j</groupId>
+          <artifactId>log4j-slf4j-impl</artifactId>
+          <scope>provided</scope>
+        </dependency>
+        <!-- Add log4j-slf4j2-impl dependency -->
+        <dependency>
+          <groupId>org.apache.logging.log4j</groupId>
+          <artifactId>log4j-slf4j2-impl</artifactId>
+        </dependency>
+      </dependencies>
     </profile>
 
     <profile>
       <id>spark3.5</id>
       <properties>
         <scala.binary.version>2.12</scala.binary.version>
-        <spark.version>3.5.0</spark.version>
+        <spark.version>3.5.1</spark.version>
         <client.type>3</client.type>
         <jackson.version>2.15.2</jackson.version>
-        <log4j.core.version>2.19.0</log4j.core.version>
+        <log4j.version>2.20.0</log4j.version>
+        <slf4j.version>2.0.7</slf4j.version>
       </properties>
       <modules>
         <module>client-spark/common</module>
@@ -1783,6 +1847,19 @@
           </dependency>
         </dependencies>
       </dependencyManagement>
+      <dependencies>
+        <!-- Remove log4j-slf4j-impl dependency -->
+        <dependency>
+          <groupId>org.apache.logging.log4j</groupId>
+          <artifactId>log4j-slf4j-impl</artifactId>
+          <scope>provided</scope>
+        </dependency>
+        <!-- Add log4j-slf4j2-impl dependency -->
+        <dependency>
+          <groupId>org.apache.logging.log4j</groupId>
+          <artifactId>log4j-slf4j2-impl</artifactId>
+        </dependency>
+      </dependencies>
     </profile>
 
     <profile>
@@ -1975,6 +2052,7 @@
         </dependencies>
       </dependencyManagement>
     </profile>
+
     <profile>
       <id>tez</id>
       <modules>
@@ -2132,6 +2210,10 @@
                 <groupId>org.apache.httpcomponents</groupId>
                 <artifactId>httpclient</artifactId>
               </exclusion>
+              <exclusion>
+                <groupId>org.slf4j</groupId>
+                <artifactId>slf4j-log4j12</artifactId>
+              </exclusion>
             </exclusions>
           </dependency>
           <dependency>
@@ -2169,6 +2251,7 @@
         </dependencies>
       </dependencyManagement>
       </profile>
+
       <profile>
       <id>kubernetes</id>
       <modules>
@@ -2211,6 +2294,7 @@
         </dependency>
       </dependencies>
     </profile>
+
     <profile>
       <id>apache-release</id>
       <build>

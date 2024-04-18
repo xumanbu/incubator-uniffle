@@ -20,10 +20,11 @@ package org.apache.spark.shuffle.writer;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collection;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
@@ -45,6 +46,7 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.Uninterruptibles;
+import org.apache.commons.collections.CollectionUtils;
 import org.apache.spark.Partitioner;
 import org.apache.spark.ShuffleDependency;
 import org.apache.spark.SparkConf;
@@ -65,8 +67,12 @@ import org.slf4j.LoggerFactory;
 import org.apache.uniffle.client.api.ShuffleManagerClient;
 import org.apache.uniffle.client.api.ShuffleWriteClient;
 import org.apache.uniffle.client.factory.ShuffleManagerClientFactory;
+import org.apache.uniffle.client.impl.FailedBlockSendTracker;
+import org.apache.uniffle.client.impl.TrackingBlockStatus;
+import org.apache.uniffle.client.request.RssReassignFaultyShuffleServerRequest;
 import org.apache.uniffle.client.request.RssReassignServersRequest;
 import org.apache.uniffle.client.request.RssReportShuffleWriteFailureRequest;
+import org.apache.uniffle.client.response.RssReassignFaultyShuffleServerResponse;
 import org.apache.uniffle.client.response.RssReassignServersReponse;
 import org.apache.uniffle.client.response.RssReportShuffleWriteFailureResponse;
 import org.apache.uniffle.common.ClientType;
@@ -77,6 +83,8 @@ import org.apache.uniffle.common.config.RssConf;
 import org.apache.uniffle.common.exception.RssException;
 import org.apache.uniffle.common.exception.RssSendFailedException;
 import org.apache.uniffle.common.exception.RssWaitFailedException;
+import org.apache.uniffle.common.rpc.StatusCode;
+import org.apache.uniffle.common.util.JavaUtils;
 import org.apache.uniffle.storage.util.StorageType;
 
 public class RssShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
@@ -88,7 +96,7 @@ public class RssShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
   private final String appId;
   private final int shuffleId;
   private WriteBufferManager bufferManager;
-  private final String taskId;
+  private String taskId;
   private final int numMaps;
   private final ShuffleDependency<K, V, C> shuffleDependency;
   private final Partitioner partitioner;
@@ -97,9 +105,9 @@ public class RssShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
   private final long sendCheckTimeout;
   private final long sendCheckInterval;
   private final int bitmapSplitNum;
-  private final Map<Integer, Set<Long>> partitionToBlockIds;
+  // server -> partitionId -> blockIds
+  private Map<ShuffleServerInfo, Map<Integer, Set<Long>>> serverToPartitionToBlockIds;
   private final ShuffleWriteClient shuffleWriteClient;
-  private final Map<Integer, List<ShuffleServerInfo>> partitionToServers;
   private final Set<ShuffleServerInfo> shuffleServersForData;
   private final long[] partitionLengths;
   private final boolean isMemoryShuffleEnabled;
@@ -107,6 +115,8 @@ public class RssShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
   private final Set<Long> blockIds = Sets.newConcurrentHashSet();
   private TaskContext taskContext;
   private SparkConf sparkConf;
+  private boolean blockFailSentRetryEnabled;
+  private int blockFailSentRetryMaxTimes = 1;
 
   /** used by columnar rss shuffle writer implementation */
   protected final long taskAttemptId;
@@ -114,6 +124,10 @@ public class RssShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
   protected final ShuffleWriteMetrics shuffleWriteMetrics;
 
   private final BlockingQueue<Object> finishEventQueue = new LinkedBlockingQueue<>();
+
+  // shuffleServerId -> failoverShuffleServer
+  private final Map<String, ShuffleServerInfo> replacementShuffleServers =
+      JavaUtils.newConcurrentMap();
 
   // Only for tests
   @VisibleForTesting
@@ -159,7 +173,7 @@ public class RssShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
       Function<String, Boolean> taskFailureCallback,
       ShuffleHandleInfo shuffleHandleInfo,
       TaskContext context) {
-    LOG.warn("RssShuffle start write taskAttemptId data" + taskAttemptId);
+    LOG.info("RssShuffle start write taskAttemptId data" + taskAttemptId);
     this.shuffleManager = shuffleManager;
     this.appId = appId;
     this.shuffleId = shuffleId;
@@ -173,17 +187,21 @@ public class RssShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
     this.sendCheckTimeout = sparkConf.get(RssSparkConfig.RSS_CLIENT_SEND_CHECK_TIMEOUT_MS);
     this.sendCheckInterval = sparkConf.get(RssSparkConfig.RSS_CLIENT_SEND_CHECK_INTERVAL_MS);
     this.bitmapSplitNum = sparkConf.get(RssSparkConfig.RSS_CLIENT_BITMAP_SPLIT_NUM);
-    this.partitionToBlockIds = Maps.newHashMap();
+    this.serverToPartitionToBlockIds = Maps.newHashMap();
     this.shuffleWriteClient = shuffleWriteClient;
-    this.shuffleServersForData = shuffleHandleInfo.getShuffleServersForData();
+    this.shuffleServersForData = shuffleHandleInfo.listAssignedServers();
     this.partitionLengths = new long[partitioner.numPartitions()];
     Arrays.fill(partitionLengths, 0);
-    partitionToServers = shuffleHandleInfo.getPartitionToServers();
     this.isMemoryShuffleEnabled =
         isMemoryShuffleEnabled(sparkConf.get(RssSparkConfig.RSS_STORAGE_TYPE.key()));
     this.taskFailureCallback = taskFailureCallback;
     this.taskContext = context;
     this.sparkConf = sparkConf;
+    this.blockFailSentRetryEnabled =
+        sparkConf.getBoolean(
+            RssSparkConfig.SPARK_RSS_CONFIG_PREFIX
+                + RssClientConf.RSS_CLIENT_BLOCK_SEND_FAILURE_RETRY_ENABLED.key(),
+            RssClientConf.RSS_CLIENT_BLOCK_SEND_FAILURE_RETRY_ENABLED.defaultValue());
   }
 
   public RssShuffleWriter(
@@ -253,9 +271,11 @@ public class RssShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
     if (isCombine) {
       createCombiner = shuffleDependency.aggregator().get().createCombiner();
     }
+    long recordCount = 0;
     while (records.hasNext()) {
-      // Task should fast fail when sending data failed
-      checkIfBlocksFailed();
+      recordCount++;
+
+      checkDataIfAnyFailure();
 
       Product2<K, V> record = records.next();
       K key = record._1();
@@ -276,6 +296,7 @@ public class RssShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
       processShuffleBlockInfos(shuffleBlockInfos);
     }
     long checkStartTs = System.currentTimeMillis();
+    checkSentRecordCount(recordCount);
     checkBlockSendResult(blockIds);
     long commitStartTs = System.currentTimeMillis();
     long checkDuration = commitStartTs - checkStartTs;
@@ -301,6 +322,16 @@ public class RssShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
             + bufferManager.getManagerCostInfo());
   }
 
+  private void checkSentRecordCount(long recordCount) {
+    if (recordCount != bufferManager.getRecordCount()) {
+      String errorMsg =
+          "Potential record loss may have occurred while preparing to send blocks for task["
+              + taskId
+              + "]";
+      throw new RssSendFailedException(errorMsg);
+    }
+  }
+
   // only push-based shuffle use this interface, but rss won't be used when push-based shuffle is
   // enabled.
   public long[] getPartitionLengths() {
@@ -318,7 +349,14 @@ public class RssShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
             blockIds.add(blockId);
             // update [partition, blockIds], it will be sent to shuffle server
             int partitionId = sbi.getPartitionId();
-            partitionToBlockIds.computeIfAbsent(partitionId, k -> Sets.newHashSet()).add(blockId);
+            sbi.getShuffleServerInfos()
+                .forEach(
+                    shuffleServerInfo -> {
+                      Map<Integer, Set<Long>> pToBlockIds =
+                          serverToPartitionToBlockIds.computeIfAbsent(
+                              shuffleServerInfo, k -> Maps.newHashMap());
+                      pToBlockIds.computeIfAbsent(partitionId, v -> Sets.newHashSet()).add(blockId);
+                    });
             partitionLengths[partitionId] += sbi.getLength();
           });
       return postBlockEvent(shuffleBlockInfoList);
@@ -330,6 +368,17 @@ public class RssShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
       List<ShuffleBlockInfo> shuffleBlockInfoList) {
     List<CompletableFuture<Long>> futures = new ArrayList<>();
     for (AddBlockEvent event : bufferManager.buildBlockEvents(shuffleBlockInfoList)) {
+      if (blockFailSentRetryEnabled) {
+        // do nothing if failed.
+        for (ShuffleBlockInfo block : event.getShuffleDataInfoList()) {
+          block.withCompletionCallback(
+              (completionBlock, isSuccessful) -> {
+                if (isSuccessful) {
+                  bufferManager.releaseBlockResource(completionBlock);
+                }
+              });
+        }
+      }
       event.addCallback(
           () -> {
             boolean ret = finishEventQueue.add(new Object());
@@ -353,7 +402,7 @@ public class RssShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
       while (true) {
         try {
           finishEventQueue.clear();
-          checkIfBlocksFailed();
+          checkDataIfAnyFailure();
           Set<Long> successBlockIds = shuffleManager.getSuccessBlockIds(taskId);
           blockIds.removeAll(successBlockIds);
           if (blockIds.isEmpty()) {
@@ -389,23 +438,152 @@ public class RssShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
     }
   }
 
-  private void checkIfBlocksFailed() {
-    Map<Long, BlockingQueue<ShuffleServerInfo>> failedBlockIdsWithShuffleServer =
-        shuffleManager.getFailedBlockIdsWithShuffleServer(taskId);
-    Set<Long> failedBlockIds = failedBlockIdsWithShuffleServer.keySet();
+  private void checkDataIfAnyFailure() {
+    if (blockFailSentRetryEnabled) {
+      collectFailedBlocksToResend();
+    } else {
+      if (hasAnyBlockFailure()) {
+        throw new RssSendFailedException("Fail to send the block");
+      }
+    }
+  }
+
+  private boolean hasAnyBlockFailure() {
+    Set<Long> failedBlockIds = shuffleManager.getFailedBlockIds(taskId);
     if (!failedBlockIds.isEmpty()) {
-      String errorMsg =
-          "Send failed: Task["
-              + taskId
-              + "]"
-              + " failed because "
-              + failedBlockIds.size()
-              + " blocks can't be sent to shuffle server: "
-              + failedBlockIdsWithShuffleServer.values().stream()
-                  .flatMap(Collection::stream)
-                  .collect(Collectors.toSet());
-      LOG.error(errorMsg);
-      throw new RssSendFailedException(errorMsg);
+      LOG.error(
+          "Errors on sending blocks for task[{}]. {} blocks can't be sent to remote servers: {}",
+          taskId,
+          failedBlockIds.size(),
+          shuffleManager.getBlockIdsFailedSendTracker(taskId).getFaultyShuffleServers());
+      return true;
+    }
+    return false;
+  }
+
+  private void collectFailedBlocksToResend() {
+    if (!blockFailSentRetryEnabled) {
+      return;
+    }
+
+    FailedBlockSendTracker failedTracker = shuffleManager.getBlockIdsFailedSendTracker(taskId);
+    if (failedTracker == null) {
+      return;
+    }
+
+    Set<Long> failedBlockIds = failedTracker.getFailedBlockIds();
+    if (CollectionUtils.isEmpty(failedBlockIds)) {
+      return;
+    }
+
+    boolean isFastFail = false;
+    Set<TrackingBlockStatus> resendCandidates = new HashSet<>();
+    // to check whether the blocks resent exceed the max resend count.
+    for (Long blockId : failedBlockIds) {
+      List<TrackingBlockStatus> failedBlockStatus = failedTracker.getFailedBlockStatus(blockId);
+      int retryIndex = failedBlockStatus.get(0).getShuffleBlockInfo().getRetryCnt();
+      // todo: support retry times by config
+      if (retryIndex >= blockFailSentRetryMaxTimes) {
+        LOG.error(
+            "Partial blocks for taskId: [{}] retry exceeding the max retry times: [{}]. Fast fail! faulty server list: {}",
+            taskId,
+            blockFailSentRetryMaxTimes,
+            failedBlockStatus.stream()
+                .map(x -> x.getShuffleServerInfo())
+                .collect(Collectors.toSet()));
+        isFastFail = true;
+        break;
+      }
+
+      // todo: if setting multi replica and another replica is succeed to send, no need to resend
+      resendCandidates.addAll(failedBlockStatus);
+    }
+
+    if (isFastFail) {
+      // release data and allocated memory
+      for (Long blockId : failedBlockIds) {
+        List<TrackingBlockStatus> failedBlockStatus = failedTracker.getFailedBlockStatus(blockId);
+        Optional<TrackingBlockStatus> blockStatus = failedBlockStatus.stream().findFirst();
+        if (blockStatus.isPresent()) {
+          blockStatus.get().getShuffleBlockInfo().executeCompletionCallback(true);
+        }
+      }
+
+      throw new RssSendFailedException(
+          "Errors on resending the blocks data to the remote shuffle-server.");
+    }
+
+    resendFailedBlocks(resendCandidates);
+  }
+
+  private void resendFailedBlocks(Set<TrackingBlockStatus> failedBlockStatusSet) {
+    List<ShuffleBlockInfo> reassignBlocks = Lists.newArrayList();
+    Map<ShuffleServerInfo, List<TrackingBlockStatus>> faultyServerToPartitions =
+        failedBlockStatusSet.stream().collect(Collectors.groupingBy(d -> d.getShuffleServerInfo()));
+
+    for (Map.Entry<ShuffleServerInfo, List<TrackingBlockStatus>> entry :
+        faultyServerToPartitions.entrySet()) {
+      Set<Integer> partitionIds =
+          entry.getValue().stream()
+              .map(x -> x.getShuffleBlockInfo().getPartitionId())
+              .collect(Collectors.toSet());
+      ShuffleServerInfo replacement = replacementShuffleServers.get(entry.getKey().getId());
+      if (replacement == null) {
+        // todo: merge multiple requests into one.
+        replacement = reassignFaultyShuffleServer(partitionIds, entry.getKey().getId());
+        replacementShuffleServers.put(entry.getKey().getId(), replacement);
+      }
+
+      for (TrackingBlockStatus blockStatus : failedBlockStatusSet) {
+        // clear the previous retry state of block
+        ShuffleBlockInfo block = blockStatus.getShuffleBlockInfo();
+        clearFailedBlockState(block);
+
+        final ShuffleBlockInfo newBlock = block;
+        newBlock.incrRetryCnt();
+        newBlock.reassignShuffleServers(Arrays.asList(replacement));
+
+        reassignBlocks.add(newBlock);
+      }
+    }
+
+    processShuffleBlockInfos(reassignBlocks);
+  }
+
+  private void clearFailedBlockState(ShuffleBlockInfo block) {
+    shuffleManager.getBlockIdsFailedSendTracker(taskId).remove(block.getBlockId());
+    block.getShuffleServerInfos().stream()
+        .filter(s -> replacementShuffleServers.containsKey(s.getId()))
+        .forEach(
+            s ->
+                serverToPartitionToBlockIds
+                    .get(s)
+                    .get(block.getPartitionId())
+                    .remove(block.getBlockId()));
+    partitionLengths[block.getPartitionId()] -= block.getLength();
+  }
+
+  private ShuffleServerInfo reassignFaultyShuffleServer(
+      Set<Integer> partitionIds, String faultyServerId) {
+    RssConf rssConf = RssSparkConfig.toRssConf(sparkConf);
+    String driver = rssConf.getString("driver.host", "");
+    int port = rssConf.get(RssClientConf.SHUFFLE_MANAGER_GRPC_PORT);
+    try (ShuffleManagerClient shuffleManagerClient = createShuffleManagerClient(driver, port)) {
+      RssReassignFaultyShuffleServerRequest request =
+          new RssReassignFaultyShuffleServerRequest(shuffleId, partitionIds, faultyServerId);
+      RssReassignFaultyShuffleServerResponse response =
+          shuffleManagerClient.reassignFaultyShuffleServer(request);
+      if (response.getStatusCode() != StatusCode.SUCCESS) {
+        throw new RssException(
+            "reassign server response with statusCode[" + response.getStatusCode() + "]");
+      }
+      if (response.getShuffleServer() == null) {
+        throw new RssException("empty newer reassignment server!");
+      }
+      return response.getShuffleServer();
+    } catch (Exception e) {
+      throw new RssException(
+          "Failed to reassign a new server for faultyServerId server[" + faultyServerId + "]", e);
     }
   }
 
@@ -454,13 +632,9 @@ public class RssShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
   public Option<MapStatus> stop(boolean success) {
     try {
       if (success) {
-        Map<Integer, List<Long>> ptb = Maps.newHashMap();
-        for (Map.Entry<Integer, Set<Long>> entry : partitionToBlockIds.entrySet()) {
-          ptb.put(entry.getKey(), Lists.newArrayList(entry.getValue()));
-        }
         long start = System.currentTimeMillis();
         shuffleWriteClient.reportShuffleResult(
-            partitionToServers, appId, shuffleId, taskAttemptId, ptb, bitmapSplitNum);
+            serverToPartitionToBlockIds, appId, shuffleId, taskAttemptId, bitmapSplitNum);
         LOG.info(
             "Report shuffle result for task[{}] with bitmapNum[{}] cost {} ms",
             taskAttemptId,
@@ -480,6 +654,17 @@ public class RssShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
         return Option.empty();
       }
     } finally {
+      if (blockFailSentRetryEnabled) {
+        if (success) {
+          if (CollectionUtils.isNotEmpty(shuffleManager.getFailedBlockIds(taskId))) {
+            LOG.error(
+                "Errors on stopping writer due to the remaining failed blockIds. This should not happen.");
+            return Option.empty();
+          }
+        } else {
+          shuffleManager.getBlockIdsFailedSendTracker(taskId).clearAndReleaseBlockResources();
+        }
+      }
       // free all memory & metadata, or memory leak happen in executor
       if (bufferManager != null) {
         bufferManager.freeAllMemory();
@@ -492,7 +677,17 @@ public class RssShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
 
   @VisibleForTesting
   Map<Integer, Set<Long>> getPartitionToBlockIds() {
-    return partitionToBlockIds;
+    return serverToPartitionToBlockIds.values().stream()
+        .flatMap(s -> s.entrySet().stream())
+        .collect(
+            Collectors.toMap(
+                Map.Entry::getKey,
+                Map.Entry::getValue,
+                (existingSet, newSet) -> {
+                  Set<Long> mergedSet = new HashSet<>(existingSet);
+                  mergedSet.addAll(newSet);
+                  return mergedSet;
+                }));
   }
 
   @VisibleForTesting
@@ -511,13 +706,10 @@ public class RssShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
   private void throwFetchFailedIfNecessary(Exception e) {
     // The shuffleServer is registered only when a Block fails to be sent
     if (e instanceof RssSendFailedException) {
-      Map<Long, BlockingQueue<ShuffleServerInfo>> failedBlockIds =
-          shuffleManager.getFailedBlockIdsWithShuffleServer(taskId);
-      List<ShuffleServerInfo> shuffleServerInfos = Lists.newArrayList();
-      for (Map.Entry<Long, BlockingQueue<ShuffleServerInfo>> longListEntry :
-          failedBlockIds.entrySet()) {
-        shuffleServerInfos.addAll(longListEntry.getValue());
-      }
+      FailedBlockSendTracker blockIdsFailedSendTracker =
+          shuffleManager.getBlockIdsFailedSendTracker(taskId);
+      List<ShuffleServerInfo> shuffleServerInfos =
+          Lists.newArrayList(blockIdsFailedSendTracker.getFaultyShuffleServers());
       RssReportShuffleWriteFailureRequest req =
           new RssReportShuffleWriteFailureRequest(
               appId,
@@ -555,5 +747,30 @@ public class RssShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
       }
     }
     throw new RssException(e);
+  }
+
+  @VisibleForTesting
+  protected void enableBlockFailSentRetry() {
+    this.blockFailSentRetryEnabled = true;
+  }
+
+  @VisibleForTesting
+  protected void setBlockFailSentRetryMaxTimes(int blockFailSentRetryMaxTimes) {
+    this.blockFailSentRetryMaxTimes = blockFailSentRetryMaxTimes;
+  }
+
+  @VisibleForTesting
+  protected void addReassignmentShuffleServer(String shuffleId, ShuffleServerInfo replacement) {
+    replacementShuffleServers.put(shuffleId, replacement);
+  }
+
+  @VisibleForTesting
+  protected void setTaskId(String taskId) {
+    this.taskId = taskId;
+  }
+
+  @VisibleForTesting
+  protected Map<ShuffleServerInfo, Map<Integer, Set<Long>>> getServerToPartitionToBlockIds() {
+    return serverToPartitionToBlockIds;
   }
 }

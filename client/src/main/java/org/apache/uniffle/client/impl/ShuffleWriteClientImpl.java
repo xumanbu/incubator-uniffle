@@ -20,16 +20,17 @@ package org.apache.uniffle.client.impl;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ForkJoinPool;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -42,6 +43,7 @@ import org.roaringbitmap.longlong.Roaring64NavigableMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.uniffle.client.PartitionDataReplicaRequirementTracking;
 import org.apache.uniffle.client.api.CoordinatorClient;
 import org.apache.uniffle.client.api.ShuffleServerClient;
 import org.apache.uniffle.client.api.ShuffleWriteClient;
@@ -60,6 +62,7 @@ import org.apache.uniffle.client.request.RssRegisterShuffleRequest;
 import org.apache.uniffle.client.request.RssReportShuffleResultRequest;
 import org.apache.uniffle.client.request.RssSendCommitRequest;
 import org.apache.uniffle.client.request.RssSendShuffleDataRequest;
+import org.apache.uniffle.client.request.RssUnregisterShuffleByAppIdRequest;
 import org.apache.uniffle.client.request.RssUnregisterShuffleRequest;
 import org.apache.uniffle.client.response.ClientResponse;
 import org.apache.uniffle.client.response.RssAppHeartBeatResponse;
@@ -73,6 +76,7 @@ import org.apache.uniffle.client.response.RssRegisterShuffleResponse;
 import org.apache.uniffle.client.response.RssReportShuffleResultResponse;
 import org.apache.uniffle.client.response.RssSendCommitResponse;
 import org.apache.uniffle.client.response.RssSendShuffleDataResponse;
+import org.apache.uniffle.client.response.RssUnregisterShuffleByAppIdResponse;
 import org.apache.uniffle.client.response.RssUnregisterShuffleResponse;
 import org.apache.uniffle.client.response.SendShuffleDataResult;
 import org.apache.uniffle.client.util.ClientUtils;
@@ -87,6 +91,7 @@ import org.apache.uniffle.common.config.RssConf;
 import org.apache.uniffle.common.exception.RssException;
 import org.apache.uniffle.common.exception.RssFetchFailedException;
 import org.apache.uniffle.common.rpc.StatusCode;
+import org.apache.uniffle.common.util.BlockIdLayout;
 import org.apache.uniffle.common.util.JavaUtils;
 import org.apache.uniffle.common.util.ThreadUtils;
 
@@ -113,6 +118,7 @@ public class ShuffleWriteClientImpl implements ShuffleWriteClient {
   private final int unregisterRequestTimeSec;
   private Set<ShuffleServerInfo> defectiveServers;
   private RssConf rssConf;
+  private BlockIdLayout blockIdLayout;
 
   public ShuffleWriteClientImpl(ShuffleClientFactory.WriteClientBuilder builder) {
     // set default value
@@ -145,6 +151,7 @@ public class ShuffleWriteClientImpl implements ShuffleWriteClient {
       defectiveServers = Sets.newConcurrentHashSet();
     }
     this.rssConf = builder.getRssConf();
+    this.blockIdLayout = BlockIdLayout.from(rssConf);
   }
 
   private boolean sendShuffleDataAsync(
@@ -152,7 +159,7 @@ public class ShuffleWriteClientImpl implements ShuffleWriteClient {
       Map<ShuffleServerInfo, Map<Integer, Map<Integer, List<ShuffleBlockInfo>>>> serverToBlocks,
       Map<ShuffleServerInfo, List<Long>> serverToBlockIds,
       Map<Long, AtomicInteger> blockIdsSendSuccessTracker,
-      Map<Long, BlockingQueue<ShuffleServerInfo>> blockIdsSendFailTracker,
+      FailedBlockSendTracker failedBlockSendTracker,
       boolean allowFastFail,
       Supplier<Boolean> needCancelRequest) {
 
@@ -203,13 +210,8 @@ public class ShuffleWriteClientImpl implements ShuffleWriteClient {
                       LOG.debug("{} successfully.", logMsg);
                     }
                   } else {
-                    serverToBlockIds
-                        .get(ssi)
-                        .forEach(
-                            blockId ->
-                                blockIdsSendFailTracker
-                                    .computeIfAbsent(blockId, id -> new LinkedBlockingQueue<>())
-                                    .add(ssi));
+                    recordFailedBlocks(
+                        failedBlockSendTracker, serverToBlocks, ssi, response.getStatusCode());
                     if (defectiveServers != null) {
                       defectiveServers.add(ssi);
                     }
@@ -217,13 +219,8 @@ public class ShuffleWriteClientImpl implements ShuffleWriteClient {
                     return false;
                   }
                 } catch (Exception e) {
-                  serverToBlockIds
-                      .get(ssi)
-                      .forEach(
-                          blockId ->
-                              blockIdsSendFailTracker
-                                  .computeIfAbsent(blockId, id -> new LinkedBlockingQueue<>())
-                                  .add(ssi));
+                  recordFailedBlocks(
+                      failedBlockSendTracker, serverToBlocks, ssi, StatusCode.INTERNAL_ERROR);
                   if (defectiveServers != null) {
                     defectiveServers.add(ssi);
                   }
@@ -250,6 +247,17 @@ public class ShuffleWriteClientImpl implements ShuffleWriteClient {
           futures.size());
     }
     return result;
+  }
+
+  void recordFailedBlocks(
+      FailedBlockSendTracker blockIdsSendFailTracker,
+      Map<ShuffleServerInfo, Map<Integer, Map<Integer, List<ShuffleBlockInfo>>>> serverToBlocks,
+      ShuffleServerInfo shuffleServerInfo,
+      StatusCode statusCode) {
+    serverToBlocks.getOrDefault(shuffleServerInfo, Collections.emptyMap()).values().stream()
+        .flatMap(innerMap -> innerMap.values().stream())
+        .flatMap(List::stream)
+        .forEach(block -> blockIdsSendFailTracker.add(block, shuffleServerInfo, statusCode));
   }
 
   void genServerToBlocks(
@@ -372,8 +380,7 @@ public class ShuffleWriteClientImpl implements ShuffleWriteClient {
                     block ->
                         blockIdsSendSuccessTracker.computeIfAbsent(
                             block, id -> new AtomicInteger(0))));
-    Map<Long, BlockingQueue<ShuffleServerInfo>> blockIdsSendFailTracker =
-        JavaUtils.newConcurrentMap();
+    FailedBlockSendTracker blockIdsSendFailTracker = new FailedBlockSendTracker();
 
     // sent the primary round of blocks.
     boolean isAllSuccess =
@@ -417,8 +424,7 @@ public class ShuffleWriteClientImpl implements ShuffleWriteClient {
                 blockIdsSendFailTracker.remove(successBlockId.getKey());
               }
             });
-    return new SendShuffleDataResult(
-        blockIdsSendSuccessSet, blockIdsSendFailTracker.keySet(), blockIdsSendFailTracker);
+    return new SendShuffleDataResult(blockIdsSendSuccessSet, blockIdsSendFailTracker);
   }
 
   /**
@@ -673,41 +679,27 @@ public class ShuffleWriteClientImpl implements ShuffleWriteClient {
 
   @Override
   public void reportShuffleResult(
-      Map<Integer, List<ShuffleServerInfo>> partitionToServers,
+      Map<ShuffleServerInfo, Map<Integer, Set<Long>>> serverToPartitionToBlockIds,
       String appId,
       int shuffleId,
       long taskAttemptId,
-      Map<Integer, List<Long>> partitionToBlockIds,
       int bitmapNum) {
-    Map<ShuffleServerInfo, List<Integer>> groupedPartitions = Maps.newHashMap();
-    Map<Integer, Integer> partitionReportTracker = Maps.newHashMap();
-    for (Map.Entry<Integer, List<ShuffleServerInfo>> entry : partitionToServers.entrySet()) {
-      int partitionIdx = entry.getKey();
-      for (ShuffleServerInfo ssi : entry.getValue()) {
-        if (!groupedPartitions.containsKey(ssi)) {
-          groupedPartitions.put(ssi, Lists.newArrayList());
-        }
-        groupedPartitions.get(ssi).add(partitionIdx);
-      }
-      if (CollectionUtils.isNotEmpty(partitionToBlockIds.get(partitionIdx))) {
-        partitionReportTracker.putIfAbsent(partitionIdx, 0);
-      }
-    }
-
-    for (Map.Entry<ShuffleServerInfo, List<Integer>> entry : groupedPartitions.entrySet()) {
-      Map<Integer, List<Long>> requestBlockIds = Maps.newHashMap();
-      for (Integer partitionId : entry.getValue()) {
-        List<Long> blockIds = partitionToBlockIds.get(partitionId);
-        if (CollectionUtils.isNotEmpty(blockIds)) {
-          requestBlockIds.put(partitionId, blockIds);
-        }
-      }
+    // record blockId count for quora check,but this is not a good realization.
+    Map<Long, Integer> blockReportTracker = createBlockReportTracker(serverToPartitionToBlockIds);
+    for (Map.Entry<ShuffleServerInfo, Map<Integer, Set<Long>>> entry :
+        serverToPartitionToBlockIds.entrySet()) {
+      Map<Integer, Set<Long>> requestBlockIds = entry.getValue();
       if (requestBlockIds.isEmpty()) {
         continue;
       }
       RssReportShuffleResultRequest request =
           new RssReportShuffleResultRequest(
-              appId, shuffleId, taskAttemptId, requestBlockIds, bitmapNum);
+              appId,
+              shuffleId,
+              taskAttemptId,
+              requestBlockIds.entrySet().stream()
+                  .collect(Collectors.toMap(Map.Entry::getKey, e -> new ArrayList<>(e.getValue()))),
+              bitmapNum);
       ShuffleServerInfo ssi = entry.getKey();
       try {
         RssReportShuffleResultResponse response =
@@ -721,9 +713,6 @@ public class ShuffleWriteClientImpl implements ShuffleWriteClient {
                   + "], shuffleId["
                   + shuffleId
                   + "] successfully");
-          for (Integer partitionId : requestBlockIds.keySet()) {
-            partitionReportTracker.put(partitionId, partitionReportTracker.get(partitionId) + 1);
-          }
         } else {
           LOG.warn(
               "Report shuffle result to "
@@ -734,6 +723,7 @@ public class ShuffleWriteClientImpl implements ShuffleWriteClient {
                   + shuffleId
                   + "] failed with "
                   + response.getStatusCode());
+          recordFailedBlockIds(blockReportTracker, requestBlockIds);
         }
       } catch (Exception e) {
         LOG.warn(
@@ -744,19 +734,37 @@ public class ShuffleWriteClientImpl implements ShuffleWriteClient {
                 + "], shuffleId["
                 + shuffleId
                 + "]");
+        recordFailedBlockIds(blockReportTracker, requestBlockIds);
       }
     }
-    // quorum check
-    for (Map.Entry<Integer, Integer> entry : partitionReportTracker.entrySet()) {
-      if (entry.getValue() < replicaWrite) {
-        throw new RssException(
-            "Quorum check of report shuffle result is failed for appId["
-                + appId
-                + "], shuffleId["
-                + shuffleId
-                + "]");
+    if (blockReportTracker.values().stream().anyMatch(cnt -> cnt < replicaWrite)) {
+      throw new RssException(
+          "Quorum check of report shuffle result is failed for appId["
+              + appId
+              + "], shuffleId["
+              + shuffleId
+              + "]");
+    }
+  }
+
+  private void recordFailedBlockIds(
+      Map<Long, Integer> blockReportTracker, Map<Integer, Set<Long>> requestBlockIds) {
+    requestBlockIds.values().stream()
+        .flatMap(Set::stream)
+        .forEach(blockId -> blockReportTracker.merge(blockId, -1, Integer::sum));
+  }
+
+  private Map<Long, Integer> createBlockReportTracker(
+      Map<ShuffleServerInfo, Map<Integer, Set<Long>>> serverToPartitionToBlockIds) {
+    Map<Long, Integer> blockIdCount = new HashMap<>();
+    for (Map<Integer, Set<Long>> partitionToBlockIds : serverToPartitionToBlockIds.values()) {
+      for (Set<Long> blockIds : partitionToBlockIds.values()) {
+        for (Long blockId : blockIds) {
+          blockIdCount.put(blockId, blockIdCount.getOrDefault(blockId, 0) + 1);
+        }
       }
     }
+    return blockIdCount;
   }
 
   @Override
@@ -767,7 +775,7 @@ public class ShuffleWriteClientImpl implements ShuffleWriteClient {
       int shuffleId,
       int partitionId) {
     RssGetShuffleResultRequest request =
-        new RssGetShuffleResultRequest(appId, shuffleId, partitionId);
+        new RssGetShuffleResultRequest(appId, shuffleId, partitionId, blockIdLayout);
     boolean isSuccessful = false;
     Roaring64NavigableMap blockIdBitmap = Roaring64NavigableMap.bitmapOf();
     int successCnt = 0;
@@ -809,20 +817,22 @@ public class ShuffleWriteClientImpl implements ShuffleWriteClient {
       Map<ShuffleServerInfo, Set<Integer>> serverToPartitions,
       String appId,
       int shuffleId,
-      Set<Integer> failedPartitions) {
-    Map<Integer, Integer> partitionReadSuccess = Maps.newHashMap();
+      Set<Integer> failedPartitions,
+      PartitionDataReplicaRequirementTracking replicaRequirementTracking) {
     Roaring64NavigableMap blockIdBitmap = Roaring64NavigableMap.bitmapOf();
+    Set<Integer> allRequestedPartitionIds = new HashSet<>();
     for (Map.Entry<ShuffleServerInfo, Set<Integer>> entry : serverToPartitions.entrySet()) {
       ShuffleServerInfo shuffleServerInfo = entry.getKey();
       Set<Integer> requestPartitions = Sets.newHashSet();
       for (Integer partitionId : entry.getValue()) {
-        partitionReadSuccess.putIfAbsent(partitionId, 0);
-        if (partitionReadSuccess.get(partitionId) < replicaRead) {
+        if (!replicaRequirementTracking.isSatisfied(partitionId, replicaRead)) {
           requestPartitions.add(partitionId);
         }
       }
+      allRequestedPartitionIds.addAll(requestPartitions);
       RssGetShuffleResultForMultiPartRequest request =
-          new RssGetShuffleResultForMultiPartRequest(appId, shuffleId, requestPartitions);
+          new RssGetShuffleResultForMultiPartRequest(
+              appId, shuffleId, requestPartitions, blockIdLayout);
       try {
         RssGetShuffleResultResponse response =
             getShuffleServerClient(shuffleServerInfo).getShuffleResultForMultiPart(request);
@@ -831,8 +841,8 @@ public class ShuffleWriteClientImpl implements ShuffleWriteClient {
           Roaring64NavigableMap blockIdBitmapOfServer = response.getBlockIdBitmap();
           blockIdBitmap.or(blockIdBitmapOfServer);
           for (Integer partitionId : requestPartitions) {
-            Integer oldVal = partitionReadSuccess.get(partitionId);
-            partitionReadSuccess.put(partitionId, oldVal + 1);
+            replicaRequirementTracking.markPartitionOfServerSuccessful(
+                partitionId, shuffleServerInfo);
           }
         }
       } catch (Exception e) {
@@ -845,12 +855,15 @@ public class ShuffleWriteClientImpl implements ShuffleWriteClient {
                 + "], shuffleId["
                 + shuffleId
                 + "], requestPartitions"
-                + requestPartitions);
+                + requestPartitions,
+            e);
       }
     }
     boolean isSuccessful =
-        partitionReadSuccess.entrySet().stream().allMatch(x -> x.getValue() >= replicaRead);
+        allRequestedPartitionIds.stream()
+            .allMatch(x -> replicaRequirementTracking.isSatisfied(x, replicaRead));
     if (!isSuccessful) {
+      LOG.error("Failed to meet replica requirement: {}", replicaRequirementTracking);
       throw new RssFetchFailedException(
           "Get shuffle result is failed for appId[" + appId + "], shuffleId[" + shuffleId + "]");
     }
@@ -984,6 +997,8 @@ public class ShuffleWriteClientImpl implements ShuffleWriteClient {
 
   @Override
   public void unregisterShuffle(String appId) {
+    RssUnregisterShuffleByAppIdRequest request = new RssUnregisterShuffleByAppIdRequest(appId);
+
     if (appId == null) {
       return;
     }
@@ -991,7 +1006,41 @@ public class ShuffleWriteClientImpl implements ShuffleWriteClient {
     if (appServerMap == null) {
       return;
     }
-    appServerMap.keySet().forEach(shuffleId -> unregisterShuffle(appId, shuffleId));
+    Set<ShuffleServerInfo> shuffleServerInfos = getAllShuffleServers(appId);
+
+    ExecutorService executorService = null;
+    try {
+      executorService =
+          ThreadUtils.getDaemonFixedThreadPool(
+              Math.min(unregisterThreadPoolSize, shuffleServerInfos.size()), "unregister-shuffle");
+
+      ThreadUtils.executeTasks(
+          executorService,
+          shuffleServerInfos,
+          shuffleServerInfo -> {
+            try {
+              ShuffleServerClient client =
+                  ShuffleServerClientFactory.getInstance()
+                      .getShuffleServerClient(clientType, shuffleServerInfo, rssConf);
+              RssUnregisterShuffleByAppIdResponse response =
+                  client.unregisterShuffleByAppId(request);
+              if (response.getStatusCode() != StatusCode.SUCCESS) {
+                LOG.warn("Failed to unregister shuffle to " + shuffleServerInfo);
+              }
+            } catch (Exception e) {
+              LOG.warn("Error happened when unregistering to " + shuffleServerInfo, e);
+            }
+            return null;
+          },
+          unregisterRequestTimeSec,
+          "unregister shuffle server");
+
+    } finally {
+      if (executorService != null) {
+        executorService.shutdownNow();
+      }
+      shuffleServerInfoMap.remove(appId);
+    }
   }
 
   private void throwExceptionIfNecessary(ClientResponse response, String errorMsg) {

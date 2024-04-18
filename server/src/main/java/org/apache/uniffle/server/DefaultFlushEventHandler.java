@@ -18,9 +18,11 @@
 package org.apache.uniffle.server;
 
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Queues;
@@ -50,17 +52,20 @@ public class DefaultFlushEventHandler implements FlushEventHandler {
   private final StorageType storageType;
   protected final BlockingQueue<ShuffleDataFlushEvent> flushQueue = Queues.newLinkedBlockingQueue();
   private ConsumerWithException<ShuffleDataFlushEvent> eventConsumer;
+  private final ShuffleServer shuffleServer;
 
   private volatile boolean stopped = false;
 
   public DefaultFlushEventHandler(
       ShuffleServerConf conf,
       StorageManager storageManager,
+      ShuffleServer shuffleServer,
       ConsumerWithException<ShuffleDataFlushEvent> eventConsumer) {
     this.shuffleServerConf = conf;
     this.storageType =
         StorageType.valueOf(shuffleServerConf.get(RssBaseConf.RSS_STORAGE_TYPE).name());
     this.storageManager = storageManager;
+    this.shuffleServer = shuffleServer;
     this.eventConsumer = eventConsumer;
     initFlushEventExecutor();
   }
@@ -83,8 +88,17 @@ public class DefaultFlushEventHandler implements FlushEventHandler {
    */
   private void handleEventAndUpdateMetrics(ShuffleDataFlushEvent event, Storage storage) {
     long start = System.currentTimeMillis();
+    String appId = event.getAppId();
+    ReentrantReadWriteLock.ReadLock readLock =
+        shuffleServer.getShuffleTaskManager().getAppReadLock(appId);
     try {
-      eventConsumer.accept(event);
+      readLock.lock();
+      try {
+        eventConsumer.accept(event);
+      } finally {
+        readLock.unlock();
+      }
+
       if (storage != null) {
         ShuffleServerMetrics.incStorageSuccessCounter(storage.getStorageHost());
       }
@@ -124,8 +138,14 @@ public class DefaultFlushEventHandler implements FlushEventHandler {
       }
 
       if (e instanceof EventInvalidException) {
+        event.doCleanup();
         return;
       }
+
+      LOG.error(
+          "Unexpected exceptions happened when handling the flush event: {}, due to ", event, e);
+      // We need to release the memory when unexpected exceptions happened
+      event.doCleanup();
     } finally {
       if (storage != null) {
         if (storage instanceof HadoopStorage) {
@@ -195,7 +215,13 @@ public class DefaultFlushEventHandler implements FlushEventHandler {
         ShuffleServerMetrics.gaugeFallbackFlushThreadPoolQueueSize.inc();
       }
 
-      dedicatedExecutor.execute(() -> handleEventAndUpdateMetrics(event, storage));
+      CompletableFuture.runAsync(
+              () -> handleEventAndUpdateMetrics(event, storage), dedicatedExecutor)
+          .exceptionally(
+              e -> {
+                LOG.error("Exception happened when handling event and updating metrics.", e);
+                return null;
+              });
     } catch (Exception e) {
       LOG.error("Exception happened when pushing events to dedicated event handler.", e);
     }
