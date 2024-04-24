@@ -39,7 +39,7 @@ public class FileSegmentManagedBuffer extends ManagedBuffer {
   private final File file;
   private final long offset;
   private final int length;
-  private boolean isFilled;
+  private volatile boolean isFilled;
   private ByteBuffer readByteBuffer;
 
   public FileSegmentManagedBuffer(File file, long offset, int length) {
@@ -80,18 +80,20 @@ public class FileSegmentManagedBuffer extends ManagedBuffer {
       isFilled = true;
       return readByteBuffer;
     } catch (IOException e) {
-      String errorMessage = "Error in reading file " + file + " " + this;
+      StringBuilder errorMessage =
+          new StringBuilder(
+              String.format(
+                  "Error in reading file %s. offset=%s length=%s",
+                  file.getAbsoluteFile(), this.offset, this.length));
       try {
         if (channel != null) {
           long size = channel.size();
-          errorMessage =
-              "Error in reading file " + file + " " + this + " (actual file length " + size + ")";
+          errorMessage.append(String.format("(actual file length=%s)", size));
         }
       } catch (IOException ignored) {
         // ignore
       }
-
-      LOG.error(errorMessage, e);
+      LOG.error(errorMessage.toString(), e);
       return ByteBuffer.allocate(0);
     } finally {
       JavaUtils.closeQuietly(channel);
