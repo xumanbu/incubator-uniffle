@@ -587,7 +587,6 @@ public class RssShuffleManager extends RssShuffleManagerBase {
 
   @Override
   public void stop() {
-    super.stop();
     if (heartBeatScheduledExecutorService != null) {
       heartBeatScheduledExecutorService.shutdownNow();
     }

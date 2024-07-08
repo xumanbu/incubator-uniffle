@@ -39,30 +39,18 @@ class AutoCloseWrapperTest {
     MockClient mockClient = mockClientAutoCloseWrapper.get();
     MockClient mockClient2 = mockClientAutoCloseWrapper.get();
     assertTrue(mockClient == mockClient2);
-    assertEquals(mockClientAutoCloseWrapper.getRefCount(), 2);
     mockClientAutoCloseWrapper.closeInternal();
     mockClientAutoCloseWrapper.closeInternal();
-    assertEquals(mockClientAutoCloseWrapper.getRefCount(), 0);
   }
 
   @Test
   void test2() {
     Supplier<MockClient> cf = () -> new MockClient(true);
     AutoCloseWrapper<MockClient> mockClientAutoCloseWrapper = new AutoCloseWrapper<>(cf, 10);
-    assertEquals(mockClientAutoCloseWrapper.getRefCount(), 0);
     MockClient mockClient1 = mockClientAutoCloseWrapper.get();
     assertNotNull(mockClient1);
-    assertEquals(mockClientAutoCloseWrapper.getRefCount(), 1);
-    AutoCloseWrapper.run(
-        mockClientAutoCloseWrapper,
-        (MockClient mockClient) -> {
-          assertEquals(mockClientAutoCloseWrapper.getRefCount(), 2);
-          return "t1";
-        });
     Uninterruptibles.sleepUninterruptibly(30, TimeUnit.MILLISECONDS);
-    assertEquals(mockClientAutoCloseWrapper.getRefCount(), 1);
     mockClientAutoCloseWrapper.closeInternal();
-    assertEquals(mockClientAutoCloseWrapper.getRefCount(), 0);
   }
 
   @Test
@@ -71,13 +59,6 @@ class AutoCloseWrapperTest {
     AutoCloseWrapper<MockClient> mockClientAutoCloseWrapper = new AutoCloseWrapper<>(cf);
     MockClient mockClient = mockClientAutoCloseWrapper.get();
     MockClient mockClient2 = mockClientAutoCloseWrapper.get();
-    assertEquals(mockClientAutoCloseWrapper.getRefCount(), 2);
-    try {
-      mockClientAutoCloseWrapper.forceClose();
-    } catch (IOException e) {
-      // ignore
-    }
-    assertEquals(mockClientAutoCloseWrapper.getRefCount(), 0);
   }
 
   static class MockClient implements Closeable {

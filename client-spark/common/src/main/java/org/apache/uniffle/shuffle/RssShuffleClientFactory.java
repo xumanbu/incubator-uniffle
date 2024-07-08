@@ -42,19 +42,19 @@ public class RssShuffleClientFactory extends ShuffleClientFactory {
   public static class ExtendWriteClientBuilder<T extends ExtendWriteClientBuilder<T>>
       extends WriteClientBuilder<T> {
     private boolean blockIdSelfManagedEnabled;
-    private AutoCloseWrapper<ShuffleManagerClient> managerClientAutoCloseWrapper;
+    private AutoCloseWrapper<ShuffleManagerClient> managerClientSupplier;
 
     public boolean isBlockIdSelfManagedEnabled() {
       return blockIdSelfManagedEnabled;
     }
 
-    public AutoCloseWrapper<ShuffleManagerClient> getManagerClientAutoCloseWrapper() {
-      return managerClientAutoCloseWrapper;
+    public AutoCloseWrapper<ShuffleManagerClient> getManagerClientSupplier() {
+      return managerClientSupplier;
     }
 
     public T managerClientAutoCloseWrapper(
         AutoCloseWrapper<ShuffleManagerClient> managerClientAutoCloseWrapper) {
-      this.managerClientAutoCloseWrapper = managerClientAutoCloseWrapper;
+      this.managerClientSupplier = managerClientAutoCloseWrapper;
       return self();
     }
 

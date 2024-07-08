@@ -17,83 +17,60 @@
 
 package org.apache.uniffle.common.util;
 
+import com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.Closeable;
 import java.io.IOException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
-
-import com.google.common.annotations.VisibleForTesting;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import org.apache.uniffle.common.exception.RssException;
 
 public class AutoCloseWrapper<T extends Closeable> implements Closeable {
 
-  private static final Logger LOG = LoggerFactory.getLogger(AutoCloseWrapper.class);
-  private final ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
-  private AtomicInteger refCount = new AtomicInteger(0);
-  private volatile T t;
-  private Supplier<T> cf;
-  private long delayCloseInterval = 3000;
+    private static final Logger LOG = LoggerFactory.getLogger(AutoCloseWrapper.class);
+    private final ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
+    private volatile T t;
+    private Supplier<T> cf;
+    private transient volatile long freshTime;
+    private long delayCloseInterval;
 
-  public AutoCloseWrapper(Supplier<T> cf) {
-    this.cf = cf;
-  }
-
-  public AutoCloseWrapper(Supplier<T> cf, long delayCloseInterval) {
-    this.cf = cf;
-    this.delayCloseInterval = delayCloseInterval;
-  }
-
-  public synchronized T get() {
-    if (refCount.incrementAndGet() == 1) {
-      t = cf.get();
+    public AutoCloseWrapper(Supplier<T> cf) {
+        this(cf, 3000);
     }
-    return t;
-  }
 
-  @Override
-  public void close() throws IOException {
-    executor.schedule(this::closeInternal, delayCloseInterval, TimeUnit.MILLISECONDS);
-  }
-
-  public synchronized void closeInternal() {
-    if (refCount.decrementAndGet() == 0) {
-      try {
-        t.close();
-      } catch (Exception e) {
-        LOG.warn("Failed to close " + t.getClass().getName() + " the resource", e);
-      } finally {
-        t = null;
-      }
+    public AutoCloseWrapper(Supplier<T> cf, long delayCloseInterval) {
+        this.cf = cf;
+        this.delayCloseInterval = delayCloseInterval;
     }
-  }
 
-  public synchronized void forceClose() throws IOException {
-    while (refCount.get() > 0) {
-      this.closeInternal();
+    public synchronized T get() {
+        freshTime = System.currentTimeMillis();
+        if (t == null) {
+            t = cf.get();
+        }
+        executor.schedule(this::closeInternal, delayCloseInterval, TimeUnit.MILLISECONDS);
+        return t;
     }
-  }
 
-  @VisibleForTesting
-  public synchronized int getRefCount() {
-    return refCount.get();
-  }
-
-  public static <T, X extends Closeable> T run(
-      AutoCloseWrapper<X> autoCloseWrapper, AutoCloseCmd<T, X> cmd) {
-    try (AutoCloseWrapper<X> wrapper = autoCloseWrapper) {
-      return cmd.execute(wrapper.get());
-    } catch (IOException e) {
-      throw new RssException("Error closing client with error:", e);
+    @VisibleForTesting
+    public synchronized void closeInternal() {
+        try {
+            t.close();
+        } catch (Exception e) {
+            LOG.warn("Failed to close " + t.getClass().getName() + " the resource", e);
+        } finally {
+            t = null;
+        }
     }
-  }
 
-  public interface AutoCloseCmd<T, X> {
-    T execute(X x);
-  }
+    public synchronized void close() throws IOException {
+        if (System.currentTimeMillis() - freshTime > delayCloseInterval) {
+            this.closeInternal();
+            freshTime = 0;
+        }
+    }
+
 }

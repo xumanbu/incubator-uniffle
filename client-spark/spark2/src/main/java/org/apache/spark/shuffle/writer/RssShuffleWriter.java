@@ -109,7 +109,7 @@ public class RssShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
   private final Set<Long> blockIds = Sets.newConcurrentHashSet();
   private TaskContext taskContext;
   private SparkConf sparkConf;
-  private AutoCloseWrapper<ShuffleManagerClient> managerClientAutoCloseWrapper;
+  private AutoCloseWrapper<ShuffleManagerClient> managerClientSupplier;
 
   public RssShuffleWriter(
       String appId,
@@ -121,7 +121,7 @@ public class RssShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
       RssShuffleManager shuffleManager,
       SparkConf sparkConf,
       ShuffleWriteClient shuffleWriteClient,
-      AutoCloseWrapper<ShuffleManagerClient> managerClientAutoCloseWrapper,
+      AutoCloseWrapper<ShuffleManagerClient> managerClientSupplier,
       RssShuffleHandle<K, V, C> rssHandle,
       SimpleShuffleHandleInfo shuffleHandleInfo,
       TaskContext context) {
@@ -134,7 +134,7 @@ public class RssShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
         shuffleManager,
         sparkConf,
         shuffleWriteClient,
-        managerClientAutoCloseWrapper,
+            managerClientSupplier,
         rssHandle,
         (tid) -> true,
         shuffleHandleInfo,
@@ -151,7 +151,7 @@ public class RssShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
       RssShuffleManager shuffleManager,
       SparkConf sparkConf,
       ShuffleWriteClient shuffleWriteClient,
-      AutoCloseWrapper<ShuffleManagerClient> managerClientAutoCloseWrapper,
+      AutoCloseWrapper<ShuffleManagerClient> managerClientSupplier,
       RssShuffleHandle<K, V, C> rssHandle,
       Function<String, Boolean> taskFailureCallback,
       ShuffleHandleInfo shuffleHandleInfo,
@@ -171,7 +171,7 @@ public class RssShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
     this.bitmapSplitNum = sparkConf.get(RssSparkConfig.RSS_CLIENT_BITMAP_SPLIT_NUM);
     this.serverToPartitionToBlockIds = Maps.newHashMap();
     this.shuffleWriteClient = shuffleWriteClient;
-    this.managerClientAutoCloseWrapper = managerClientAutoCloseWrapper;
+    this.managerClientSupplier = managerClientSupplier;
     this.shuffleServersForData = shuffleHandleInfo.getServers();
     this.partitionToServers = shuffleHandleInfo.getAvailablePartitionServersForWriter();
     this.isMemoryShuffleEnabled =
@@ -190,7 +190,7 @@ public class RssShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
       RssShuffleManager shuffleManager,
       SparkConf sparkConf,
       ShuffleWriteClient shuffleWriteClient,
-      AutoCloseWrapper<ShuffleManagerClient> managerClientAutoCloseWrapper,
+      AutoCloseWrapper<ShuffleManagerClient> managerClientSupplier,
       RssShuffleHandle<K, V, C> rssHandle,
       Function<String, Boolean> taskFailureCallback,
       TaskContext context,
@@ -204,7 +204,7 @@ public class RssShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
         shuffleManager,
         sparkConf,
         shuffleWriteClient,
-        managerClientAutoCloseWrapper,
+            managerClientSupplier,
         rssHandle,
         taskFailureCallback,
         shuffleHandleInfo,
@@ -545,11 +545,7 @@ public class RssShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
               shuffleServerInfos,
               e.getMessage());
       RssReportShuffleWriteFailureResponse response =
-          AutoCloseWrapper.run(
-              managerClientAutoCloseWrapper,
-              (ShuffleManagerClient client) -> {
-                return client.reportShuffleWriteFailure(req);
-              });
+              managerClientSupplier.get().reportShuffleWriteFailure(req);
       if (response.getReSubmitWholeStage()) {
         // The shuffle server is reassigned.
         RssReassignServersRequest rssReassignServersRequest =
@@ -559,11 +555,7 @@ public class RssShuffleWriter<K, V, C> extends ShuffleWriter<K, V> {
                 shuffleId,
                 partitioner.numPartitions());
         RssReassignServersResponse rssReassignServersResponse =
-            AutoCloseWrapper.run(
-                managerClientAutoCloseWrapper,
-                (ShuffleManagerClient client) -> {
-                  return client.reassignOnStageResubmit(rssReassignServersRequest);
-                });
+                managerClientSupplier.get().reassignOnStageResubmit(rssReassignServersRequest);
         LOG.info(
             "Whether the reassignment is successful: {}",
             rssReassignServersResponse.isNeedReassign());

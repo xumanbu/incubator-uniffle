@@ -590,12 +590,8 @@ public abstract class RssShuffleManagerBase implements RssShuffleManagerInterfac
     RssPartitionToShuffleServerRequest rssPartitionToShuffleServerRequest =
         new RssPartitionToShuffleServerRequest(shuffleId);
     RssReassignOnStageRetryResponse rpcPartitionToShufflerServer =
-        AutoCloseWrapper.run(
-            getOrCreateShuffleManagerClientWrapper(),
-            (ShuffleManagerClient shuffleManagerClient) -> {
-              return shuffleManagerClient.getPartitionToShufflerServerWithStageRetry(
+            getOrCreateShuffleManagerClientWrapper().get().getPartitionToShufflerServerWithStageRetry(
                   rssPartitionToShuffleServerRequest);
-            });
     StageAttemptShuffleHandleInfo shuffleHandleInfo =
         StageAttemptShuffleHandleInfo.fromProto(
             rpcPartitionToShufflerServer.getShuffleHandleInfoProto());
@@ -613,12 +609,8 @@ public abstract class RssShuffleManagerBase implements RssShuffleManagerInterfac
     RssPartitionToShuffleServerRequest rssPartitionToShuffleServerRequest =
         new RssPartitionToShuffleServerRequest(shuffleId);
     RssReassignOnBlockSendFailureResponse rpcPartitionToShufflerServer =
-        AutoCloseWrapper.run(
-            getOrCreateShuffleManagerClientWrapper(),
-            (ShuffleManagerClient shuffleManagerClient) -> {
-              return shuffleManagerClient.getPartitionToShufflerServerWithBlockRetry(
-                  rssPartitionToShuffleServerRequest);
-            });
+            getOrCreateShuffleManagerClientWrapper().get().getPartitionToShufflerServerWithBlockRetry(
+                    rssPartitionToShuffleServerRequest);
     MutableShuffleHandleInfo shuffleHandleInfo =
         MutableShuffleHandleInfo.fromProto(rpcPartitionToShufflerServer.getHandle());
     return shuffleHandleInfo;
@@ -817,17 +809,6 @@ public abstract class RssShuffleManagerBase implements RssShuffleManagerInterfac
           reassignResult);
 
       return internalHandle;
-    }
-  }
-
-  @Override
-  public void stop() {
-    if (managerClientAutoCloseWrapper != null) {
-      try {
-        managerClientAutoCloseWrapper.forceClose();
-      } catch (IOException e) {
-        LOG.warn("Errors on closing shuffleManagerClient", e);
-      }
     }
   }
 
